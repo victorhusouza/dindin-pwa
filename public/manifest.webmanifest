@@ -1,0 +1,16 @@
+{
+  "name": "Minhas Finanças",
+  "short_name": "Finanças",
+  "description": "Controle pessoal de despesas, receitas e contas fixas.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f5f1ec",
+  "theme_color": "#171315",
+  "icons": [
+    {
+      "src": "./icon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
