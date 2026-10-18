@@ -891,7 +891,7 @@ function RecForm(props: {
 
     const submit = () => {
         const cents = parseBRValue(valor);
-        if (!cents) { setErr('Informe um valor válido, por exemplo 2599,00.'); return; }
+        if (!cents) { setErr('Informe um valor válido, por exemplo 99,90.'); return; }
         const dueDay = Math.round(Number(dia));
         if (!isFinite(dueDay) || dueDay < 1 || dueDay > 31) { setErr('O dia de vencimento precisa ser entre 1 e 31.'); return; }
         if (!desc.trim()) { setErr('Dê um nome para a conta fixa.'); return; }
