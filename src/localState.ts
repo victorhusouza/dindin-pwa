@@ -9,7 +9,7 @@ export interface LocalStateMeta {
     message: string;
 }
 
-export function useLocalState<T>(key: string, initial: T): [T, (v: T) => void, LocalStateMeta] {
+export function useLocalState<T>(key: string, initial: T): [T, (v: T) => boolean, LocalStateMeta] {
     const [value, setValue] = useState<T>(() => {
         try {
             const raw = window.localStorage.getItem(key);
@@ -20,12 +20,16 @@ export function useLocalState<T>(key: string, initial: T): [T, (v: T) => void, L
         return initial;
     });
 
-    const set = (v: T) => {
+    // Retorna false quando a gravação não persistiu (sem espaço ou acesso bloqueado),
+    // para quem chama decidir se tenta de novo ou avisa. O estado em memória sempre atualiza.
+    const set = (v: T): boolean => {
         setValue(v);
         try {
             window.localStorage.setItem(key, JSON.stringify(v));
+            return true;
         } catch {
             // sem acesso ao armazenamento: mantém só em memória
+            return false;
         }
     };
 

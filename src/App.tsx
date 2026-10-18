@@ -96,6 +96,22 @@ function packChunks(s: string): string[] {
     return out;
 }
 
+// Armazenamento compacto: [data, descricao, categoria, centavos, 'r'|'d', recKey|0].
+// O formato antigo (objetos com id) ainda é lido; na próxima gravação vira compacto.
+type PackedTx = [string, string, string, number, string, string | 0];
+
+function packTx(t: Tx): PackedTx {
+    return [t.date, t.desc, t.cat, t.cents, t.type === 'receita' ? 'r' : 'd', t.recKey ?? 0];
+}
+
+function unpackTx(p: unknown, i: number): Tx | null {
+    if (Array.isArray(p)) {
+        return { id: 't' + i, date: p[0], desc: p[1], cat: p[2], cents: p[3], type: p[4] === 'r' ? 'receita' : 'despesa', recKey: p[5] ? p[5] : undefined };
+    }
+    if (p && typeof p === 'object' && 'id' in p) return p as Tx;
+    return null;
+}
+
 // Oito chaves fixas, cada uma dentro do limite por valor.
 function useChunkedTxs(): [Tx[], (v: Tx[]) => boolean, { ready: boolean; message: string }] {
     const h0 = useLocalState('mf.txs.0', '');
@@ -112,14 +128,19 @@ function useChunkedTxs(): [Tx[], (v: Tx[]) => boolean, { ready: boolean; message
     const joined = hooks.map(h => h[0] || '').join('');
     let txs: Tx[] = [];
     if (joined) {
-        try { txs = JSON.parse(joined); } catch (e) { txs = []; }
+        try {
+            const raw: unknown = JSON.parse(joined);
+            if (Array.isArray(raw)) txs = raw.map((p, i) => unpackTx(p, i)).filter((t): t is Tx => t !== null);
+        } catch (e) { txs = []; }
     }
     const set = (v: Tx[]): boolean => {
-        const s = JSON.stringify(v);
+        const s = JSON.stringify(v.map(packTx));
         if (s.length > CHUNKS * CHUNK_CAP) return false;
         const parts = packChunks(s);
-        hooks.forEach((h, i) => h[1](parts[i]));
-        return true;
+        let ok = true;
+        // Grava do fim para o começo: libera as fatias antigas grandes antes de escrever as novas, sem estourar a cota total no meio do caminho.
+        for (let i = CHUNKS - 1; i >= 0; i--) { if (!hooks[i][1](parts[i])) ok = false; }
+        return ok;
     };
     return [txs, set, { ready, message }];
 }
