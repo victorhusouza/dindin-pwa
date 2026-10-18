@@ -68,6 +68,18 @@ function uid(): string {
     return 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
+function donutSlice(cx: number, cy: number, rOut: number, rIn: number, a0: number, a1: number): string {
+    // Fatia de rosca entre os ângulos a0 e a1 (radianos, 0 = topo, sentido horário).
+    const clamped = Math.min(a1, a0 + Math.PI * 2 - 0.0001);
+    const large = clamped - a0 > Math.PI ? 1 : 0;
+    const pt = (r: number, a: number) => [cx + r * Math.sin(a), cy - r * Math.cos(a)];
+    const [x0, y0] = pt(rOut, a0);
+    const [x1, y1] = pt(rOut, clamped);
+    const [x2, y2] = pt(rIn, clamped);
+    const [x3, y3] = pt(rIn, a0);
+    return 'M' + x0.toFixed(2) + ' ' + y0.toFixed(2) + ' A' + rOut + ' ' + rOut + ' 0 ' + large + ' 1 ' + x1.toFixed(2) + ' ' + y1.toFixed(2) + ' L' + x2.toFixed(2) + ' ' + y2.toFixed(2) + ' A' + rIn + ' ' + rIn + ' 0 ' + large + ' 0 ' + x3.toFixed(2) + ' ' + y3.toFixed(2) + ' Z';
+}
+
 function todayISO(): string {
     const d = new Date();
     return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
@@ -369,6 +381,7 @@ export function App() {
     const [showForm, setShowForm] = useState(false);
     const [editing, setEditing] = useState<Tx | null>(null);
     const [menuOpen, setMenuOpen] = useState(false);
+    const [selCat, setSelCat] = useState<string | null>(null);
     const [showInstall, setShowInstall] = useState(false);
     const [preview, setPreview] = useState<ImportPreview | null>(null);
     const [restore, setRestore] = useState<{ txs: Tx[]; cats: Category[] } | null>(null);
@@ -645,10 +658,47 @@ export function App() {
 
             {catTotals.length > 0 && <section className="panel">
                 <h2>Despesas por categoria</h2>
+                {(() => {
+                    const shown = catTotals.slice(0, 5).reduce((s, c) => s + c.cents, 0);
+                    const rest = Math.max(0, totals.desp - shown);
+                    // Rosca: só as 5 maiores categorias; o restante entra em "Outras".
+                    const slices: { key: string; label: string; icon: string | null; color: string; cents: number }[] = catTotals.slice(0, 5).map(({ cat, cents }) => {
+                        const c = catById(cat);
+                        return { key: cat, label: c.label, icon: c.icon, color: c.color, cents };
+                    });
+                    if (rest > 0) slices.push({ key: '__outras', label: 'Outras', icon: null, color: 'var(--ink2)', cents: rest });
+                    const totalAll = Math.max(1, shown + rest);
+                    let angle = 0;
+                    const GAP = slices.length > 1 ? 0.012 : 0;
+                    return <div className="donut-wrap">
+                        <svg className="donut-svg" viewBox="0 0 200 200" role="img" aria-label="Gráfico circular das despesas por categoria">
+                            {slices.map(s => {
+                                const span = (s.cents / totalAll) * Math.PI * 2;
+                                const a0 = angle + (span > GAP * 2 ? GAP : 0);
+                                const a1 = angle + span - (span > GAP * 2 ? GAP : 0);
+                                angle += span;
+                                return <path key={s.key} d={donutSlice(100, 100, 92, 58, a0, a1)} fill={s.color} className={selCat ? (selCat === s.key ? 'donut-sel' : 'donut-dim') : ''} onClick={() => setSelCat(selCat === s.key ? null : s.key)}><title>{s.label}: {fmt(s.cents)} ({Math.max(1, Math.round((s.cents / totalAll) * 100))}%) - toque para destacar</title></path>;
+                            })}
+                            <text x="100" y="96" textAnchor="middle" className="donut-center-v">{fmt(totals.desp)}</text>
+                            <text x="100" y="116" textAnchor="middle" className="donut-center-k">no mês</text>
+                        </svg>
+                        <div className="donut-legend">
+                            {slices.map(s => {
+                                const pct = (s.cents / totalAll) * 100;
+                                return <div className={'donut-row' + (selCat ? (selCat === s.key ? ' donut-sel' : ' donut-dim') : '')} key={s.key} onClick={() => setSelCat(selCat === s.key ? null : s.key)}>
+                                    <span className="donut-dot" style={{ background: s.color }} />
+                                    <span className="donut-label">{s.icon ? s.icon + ' ' : ''}{s.label}</span>
+                                    <span className="donut-pct">{pct >= 1 ? Math.round(pct) + '%' : '<1%'}</span>
+                                </div>;
+                            })}
+                        </div>
+                    </div>;
+                })()}
                 {catTotals.map(({ cat, cents }) => {
                     const c = catById(cat);
                     const max = catTotals[0].cents;
-                    return <div className="bar" key={cat}>
+                    const dkey = catTotals.slice(0, 5).some(t => t.cat === cat) ? cat : '__outras';
+                    return <div className={'bar' + (selCat ? (selCat === dkey ? ' donut-sel' : ' donut-dim') : '')} key={cat} onClick={() => setSelCat(selCat === dkey ? null : dkey)}>
                         <span className="bar-icon">{c.icon}</span>
                         <div className="bar-main">
                             <div className="bar-top"><span className="bar-label">{c.label}</span><span className="bar-value">{fmt(cents)}</span></div>
