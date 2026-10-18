@@ -709,7 +709,7 @@ export function App() {
 
             {menuOpen && <div className="overlay" onClick={() => setMenuOpen(false)}>
                 <div className="sheet" onClick={e => e.stopPropagation()}>
-                    <h2>Opções</h2>
+                    <div className="sheethead"><h2>Opções</h2><button className="sheetx" aria-label="Fechar" onClick={() => setMenuOpen(false)}>✕</button></div>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); importInput.current && importInput.current.click(); }}>📥 Importar arquivo (Mobills, OFX, CSV)</button>
                     <button className="sheetbtn" onClick={exportBackup}>☁️ Exportar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); restoreInput.current && restoreInput.current.click(); }}>↩️ Restaurar backup</button>
@@ -720,7 +720,7 @@ export function App() {
 
             {showInstall && <div className="overlay" onClick={() => setShowInstall(false)}>
                 <div className="sheet" onClick={e => e.stopPropagation()}>
-                    <h2>Instalar no iPhone</h2>
+                    <div className="sheethead"><h2>Instalar no iPhone</h2><button className="sheetx" aria-label="Fechar" onClick={() => setShowInstall(false)}>✕</button></div>
                     <ol className="install-steps">
                         <li>Abra este link no <strong>Safari</strong>.</li>
                         <li>Toque em <strong>Compartilhar</strong> (o quadrado com a seta).</li>
@@ -733,7 +733,7 @@ export function App() {
 
             {preview && <div className="overlay">
                 <div className="sheet">
-                    <h2>Importar de {preview.source}</h2>
+                    <div className="sheethead"><h2>Importar de {preview.source}</h2><button className="sheetx" aria-label="Fechar" onClick={() => setPreview(null)}>✕</button></div>
                     <p>{preview.txs.length} lançamentos encontrados
                         {preview.skipped > 0 ? ' · ' + preview.skipped + ' duplicados serão ignorados' : ''}.</p>
                     <div className="preview-list">
@@ -751,7 +751,7 @@ export function App() {
 
             {restore && <div className="overlay">
                 <div className="sheet">
-                    <h2>Restaurar backup</h2>
+                    <div className="sheethead"><h2>Restaurar backup</h2><button className="sheetx" aria-label="Fechar" onClick={() => setRestore(null)}>✕</button></div>
                     <p>O backup tem {restore.txs.length} lançamentos. Restaurar <strong>substitui</strong> todos os dados atuais deste aparelho.</p>
                     <button className="sheetbtn primary" onClick={confirmRestore}>Substituir e restaurar</button>
                     <button className="sheetbtn ghost" onClick={() => setRestore(null)}>Cancelar</button>
@@ -828,7 +828,7 @@ function TxForm(props: {
 
     return <div className="overlay">
         <div className="sheet form">
-            <h2>{initial ? 'Editar lançamento' : 'Novo lançamento'}</h2>
+            <div className="sheethead"><h2>{initial ? 'Editar lançamento' : 'Novo lançamento'}</h2><button className="sheetx" aria-label="Fechar" onClick={props.onClose}>✕</button></div>
             <div className="typetoggle">
                 <button className={type === 'despesa' ? 'active desp' : ''} onClick={() => setType('despesa')}>Despesa</button>
                 <button className={type === 'receita' ? 'active rec' : ''} onClick={() => setType('receita')}>Receita</button>
@@ -900,7 +900,7 @@ function RecForm(props: {
 
     return <div className="overlay">
         <div className="sheet form">
-            <h2>{initial ? 'Editar conta fixa' : 'Nova conta fixa'}</h2>
+            <div className="sheethead"><h2>{initial ? 'Editar conta fixa' : 'Nova conta fixa'}</h2><button className="sheetx" aria-label="Fechar" onClick={props.onClose}>✕</button></div>
             <label className="field">
                 <span>Nome</span>
                 <input type="text" placeholder="Ex.: Aluguel" value={desc} onChange={e => setDesc(e.target.value)} autoFocus={!initial} />
