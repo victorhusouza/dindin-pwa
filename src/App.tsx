@@ -100,7 +100,7 @@ function slug(s: string): string {
 // ---------- persistência no aparelho (via viewer) ----------
 
 const CHUNKS = 8;
-const CHUNK_CAP = 14000; // margem abaixo do limite de 16 KiB por valor
+const CHUNK_CAP = 11000; // o limite de 16 KiB do viewer mede o valor DEPOIS do escape JSON (~+20%): 11k chars ficam ~13.5 KiB
 
 function packChunks(s: string): string[] {
     const out: string[] = [];
@@ -125,7 +125,39 @@ function unpackTx(p: unknown, i: number): Tx | null {
 }
 
 // Oito chaves fixas, cada uma dentro do limite por valor.
-function useChunkedTxs(): [Tx[], (v: Tx[]) => boolean, { ready: boolean; message: string }] {
+// Resgata linhas completas de um estado misto/corrompido (gravacoes parciais).
+// Cada linha compacta e autocontida: ["data","desc","cat",centavos,"r"|"d",recKey|0].
+function salvageRows(joined: string): Tx[] {
+    const out: Tx[] = [];
+    const rowRe = /\["(\d{4}-\d{2}-\d{2})","((?:[^"\\]|\\.)*)","((?:[^"\\]|\\.)*)",(\d+),"([rd])",("(?:[^"\\]|\\.)*"|0)\]/g;
+    let m: RegExpExecArray | null;
+    while ((m = rowRe.exec(joined))) {
+        try {
+            const desc = JSON.parse('"' + m[2] + '"') as string;
+            const cat = JSON.parse('"' + m[3] + '"') as string;
+            const recRaw = m[6] === '0' ? 0 : (JSON.parse(m[6]) as string);
+            out.push({ id: 's' + out.length, date: m[1], desc, cat, cents: Number(m[4]), type: m[5] === 'r' ? 'receita' : 'despesa', recKey: recRaw ? recRaw : undefined });
+        } catch { /* ignora linha ilegível */ }
+    }
+    // Formato antigo (objetos com id), se ainda houver restos.
+    const objRe = /\{"id":"[^"]*","date":"(\d{4}-\d{2}-\d{2})","desc":"((?:[^"\\]|\\.)*)","cat":"((?:[^"\\]|\\.)*)","cents":(\d+),"type":"(receita|despesa)"(?:,"recKey":"((?:[^"\\]|\\.)*)")?\}/g;
+    while ((m = objRe.exec(joined))) {
+        try {
+            out.push({ id: 's' + out.length, date: m[1], desc: JSON.parse('"' + m[2] + '"'), cat: JSON.parse('"' + m[3] + '"'), cents: Number(m[4]), type: m[5] as 'receita' | 'despesa', recKey: m[6] ? JSON.parse('"' + m[6] + '"') : undefined });
+        } catch { /* ignora */ }
+    }
+    // Dedupe exato e ordem por data desc.
+    const seen = new Set<string>();
+    return out.filter(t => {
+        const k = [t.date, t.desc, t.cat, t.cents, t.type, t.recKey ?? ''].join('|');
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+    }).sort((a, b) => b.date.localeCompare(a.date));
+}
+
+// Oito chaves fixas, cada uma dentro do limite por valor.
+function useChunkedTxs(): [Tx[], (v: Tx[]) => boolean, { ready: boolean; message: string; failed: boolean; salvage: boolean }] {
     const h0 = useLocalState('mf.txs.0', '');
     const h1 = useLocalState('mf.txs.1', '');
     const h2 = useLocalState('mf.txs.2', '');
@@ -137,24 +169,34 @@ function useChunkedTxs(): [Tx[], (v: Tx[]) => boolean, { ready: boolean; message
     const hooks = [h0, h1, h2, h3, h4, h5, h6, h7];
     const ready = hooks.every(h => h[2] && h[2].ready);
     const message = Array.from(new Set(hooks.map(h => (h[2] && h[2].message) || '').filter(Boolean))).join(' ');
+    const failed = hooks.some(h => { const st = (h[2] as unknown as { status?: string }).status; return st === 'quota' || st === 'invalid'; });
     const joined = hooks.map(h => h[0] || '').join('');
+    let salvage = false;
     let txs: Tx[] = [];
     if (joined) {
         try {
             const raw: unknown = JSON.parse(joined);
             if (Array.isArray(raw)) txs = raw.map((p, i) => unpackTx(p, i)).filter((t): t is Tx => t !== null);
-        } catch (e) { txs = []; }
+        } catch (e) {
+            // Estado misto de gravacoes parciais: resgata as linhas completas.
+            txs = salvageRows(joined);
+            salvage = txs.length > 0;
+        }
     }
     const set = (v: Tx[]): boolean => {
         const s = JSON.stringify(v.map(packTx));
         if (s.length > CHUNKS * CHUNK_CAP) return false;
         const parts = packChunks(s);
+        // Pré-checagem: o viewer rejeita valores cujo JSON escapado passa de 16 KiB.
+        for (const p of parts) {
+            if (new TextEncoder().encode(JSON.stringify(p)).length > 16384 - 32) return false;
+        }
         let ok = true;
         // Grava do fim para o começo: libera as fatias antigas grandes antes de escrever as novas, sem estourar a cota total no meio do caminho.
         for (let i = CHUNKS - 1; i >= 0; i--) { if (!hooks[i][1](parts[i])) ok = false; }
         return ok;
     };
-    return [txs, set, { ready, message }];
+    return [txs, set, { ready, message, failed, salvage }];
 }
 
 // ---------- leitura de XLSX (sem dependências) ----------
@@ -366,8 +408,107 @@ interface ImportPreview {
     skipped: number;
 }
 
+// ---- Integracao com o viewer: sheets acompanham a viewport visivel ----
+// O viewer do Instinct Files estica o iframe ate a altura total do conteudo,
+// entao position:fixed ancoraria o sheet no documento inteiro (e nao na tela).
+// O viewer publica mensagens "modal-viewport" com {top, height} da area visivel
+// e trava a rolagem do fundo quando avisamos que um modal esta aberto.
+type VpInfo = { top: number; height: number };
+let shellChannel: string | null = null;
+let lastVp: VpInfo | null = null;
+let vpListenerAttached = false;
+let vpOptInSent = false;
+let modalCount = 0;
+const vpListeners = new Set<(v: VpInfo) => void>();
+
+function shellPost(msg: Record<string, unknown>) {
+    try {
+        if (window.parent && window.parent !== window && shellChannel) {
+            window.parent.postMessage({ source: 'instinct-file', channel: shellChannel, ...msg }, '*');
+        }
+    } catch { /* sem viewer por perto */ }
+}
+
+function attachVpListener() {
+    if (vpListenerAttached) return;
+    vpListenerAttached = true;
+    window.addEventListener('message', (e) => {
+        const d = e.data as { source?: string; channel?: string; type?: string; value?: { top?: number; height?: number } } | null;
+        if (!d || typeof d !== 'object' || d.source !== 'instinct-shell') return;
+        if (typeof d.channel === 'string' && /^[a-f0-9-]{36}$/.test(d.channel)) shellChannel = d.channel;
+        if (d.type === 'modal-viewport' && d.value && typeof d.value.top === 'number' && typeof d.value.height === 'number') {
+            lastVp = { top: Math.max(0, d.value.top), height: Math.max(1, d.value.height) };
+            vpListeners.forEach(fn => fn(lastVp!));
+        }
+    });
+}
+
+function modalOpened() {
+    modalCount += 1;
+    if (modalCount === 1) shellPost({ type: 'modal', value: true });
+}
+function modalClosed() {
+    modalCount = Math.max(0, modalCount - 1);
+    if (modalCount === 0) shellPost({ type: 'modal', value: false });
+}
+
+function Overlay({ onClose, children }: { onClose?: () => void; children: React.ReactNode }) {
+    const [vp, setVp] = useState<VpInfo | null>(lastVp);
+    useEffect(() => {
+        attachVpListener();
+        const fn = (v: VpInfo) => setVp(v);
+        vpListeners.add(fn);
+        // Avisa o viewer que um modal abriu (trava a rolagem do fundo) e pede
+        // as atualizacoes de viewport. O canal chega nas mensagens do viewer,
+        // entao reenviamos ate ele estar disponivel.
+        let opened = false;
+        const activate = () => {
+            if (!shellChannel) return false;
+            if (!vpOptInSent) { vpOptInSent = true; shellPost({ type: 'modal-viewport', value: true }); }
+            if (!opened) { opened = true; modalOpened(); }
+            return true;
+        };
+        activate();
+        const t = window.setInterval(() => { if (activate()) window.clearInterval(t); }, 200);
+        return () => {
+            vpListeners.delete(fn);
+            window.clearInterval(t);
+            if (opened) modalClosed();
+        };
+    }, []);
+    const style: React.CSSProperties | undefined = vp
+        ? { position: 'absolute', top: vp.top, left: 0, right: 0, height: vp.height, inset: 'auto' }
+        : undefined;
+    return <div className="overlay" style={style} onClick={onClose}>{children}</div>;
+}
+
+function StorageMeter({ txs, cats, recs }: { txs: Tx[]; cats: Category[]; recs: Rec[] }) {
+    const kb = useMemo(() => {
+        const enc = new TextEncoder();
+        const txJson = JSON.stringify(txs.map(packTx));
+        // O viewer guarda os valores escapados (~+20%) e cobra 64 KiB no total.
+        const bytes = enc.encode(txJson).length * 1.2
+            + enc.encode(JSON.stringify(cats)).length * 1.2
+            + enc.encode(JSON.stringify(recs)).length * 1.2
+            + 2048; // marcadores de meses e tema
+        return bytes / 1024;
+    }, [txs, cats, recs]);
+    const pct = Math.min(100, Math.round((kb / 64) * 100));
+    return <div style={{ marginTop: 14, fontSize: 12, color: 'var(--ink2)', textAlign: 'center' }}>
+        Armazenamento: ~{kb.toFixed(0)} KB de 64 KB ({pct}%)
+    </div>;
+}
 export function App() {
     const [txs, setTxs, txsSaved] = useChunkedTxs();
+    // Chaves legadas de versoes antigas do app: o viewer nunca apaga chaves, entao
+    // restos grandes continuam contando na cota de 64 KiB. Gravar null encolhe cada uma.
+    const legA = useLocalState('mf.txs', null as unknown);
+    const legB = useLocalState('mf.txs.v1', null as unknown);
+    const legC = useLocalState('mf.txs.v2', null as unknown);
+    const legD = useLocalState('mf.data', null as unknown);
+    const legE = useLocalState('mf.state', null as unknown);
+    const txsRef = useRef<Tx[]>([]);
+    txsRef.current = txs;
     const [cats, setCats, catsSaved] = useLocalState('mf.cats.v1', [] as Category[]);
     const [recs, setRecs, recsSaved] = useLocalState('mf.recs.v1', SEED_RECS);
     const [recEditing, setRecEditing] = useState<Rec | null>(null);
@@ -465,6 +606,54 @@ export function App() {
         if (!ok) setNotice('Limite de armazenamento atingido. Exporte um backup para não perder dados.');
         return ok;
     };
+
+    const persistTxsRef = useRef(persistTxs);
+    persistTxsRef.current = persistTxs;
+
+    // Gravacao assincrona falhou (quota/invalid): libera chaves legadas e tenta de novo.
+    const reclaimedRef = useRef(false);
+    useEffect(() => {
+        if (!txsSaved.failed || reclaimedRef.current) return;
+        reclaimedRef.current = true;
+        for (const [val, setLeg] of [legA, legB, legC, legD, legE]) {
+            if (val !== null && val !== undefined) setLeg(null);
+        }
+        const t = setTimeout(() => persistTxsRef.current(txsRef.current), 1500);
+        return () => clearTimeout(t);
+    }, [txsSaved.failed]);
+
+    // Aviso só se continuar falhando depois da limpeza.
+    useEffect(() => {
+        if (!txsSaved.failed || !reclaimedRef.current) return;
+        const t = setTimeout(() => {
+            if (txsSaved.failed) setNotice('Limite de armazenamento atingido. Exporte um backup para não perder dados.');
+        }, 4000);
+        return () => clearTimeout(t);
+    }, [txsSaved.failed]);
+
+    // Regrava o estado resgatado de gravacoes corrompidas (linhas recuperadas, limpo e compacto).
+    const salvageRef = useRef(false);
+    useEffect(() => {
+        if (!txsSaved.ready || !txsSaved.salvage || salvageRef.current) return;
+        salvageRef.current = true;
+        persistTxsRef.current(txsRef.current);
+    }, [txsSaved.ready, txsSaved.salvage]);
+
+    // Remove duplicatas exatas acumuladas (mantém a mais recente), uma vez por abertura.
+    const dedupedRef = useRef(false);
+    useEffect(() => {
+        if (!txsSaved.ready || dedupedRef.current || txsRef.current.length === 0) return;
+        dedupedRef.current = true;
+        const seen = new Set<string>();
+        let changed = false;
+        const out = txsRef.current.filter(t => {
+            const k = [t.date, t.desc, t.cat, t.cents, t.type, t.recKey ?? ''].join('|');
+            if (seen.has(k)) { changed = true; return false; }
+            seen.add(k);
+            return true;
+        });
+        if (changed) persistTxsRef.current(out);
+    }, [txsSaved.ready]);
 
     const saveTx = (tx: Tx) => {
         const exists = txs.some(t => t.id === tx.id);
@@ -778,18 +967,19 @@ export function App() {
 
             {notice !== '' && <div className="toast" role="status">{notice}</div>}
 
-            {menuOpen && <div className="overlay" onClick={() => setMenuOpen(false)}>
+            {menuOpen && <Overlay onClose={() => setMenuOpen(false)}>
                 <div className="sheet" onClick={e => e.stopPropagation()}>
                     <div className="sheethead"><h2>Opções</h2><button className="sheetx" aria-label="Fechar" onClick={() => setMenuOpen(false)}>✕</button></div>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); importInput.current && importInput.current.click(); }}>📥 Importar arquivo (Mobills, OFX, CSV)</button>
                     <button className="sheetbtn" onClick={exportBackup}>☁️ Exportar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); restoreInput.current && restoreInput.current.click(); }}>↩️ Restaurar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowInstall(true); }}>📲 Instalar na tela de início</button>
+                    <StorageMeter txs={txs} cats={cats} recs={recs} />
                     <button className="sheetbtn ghost" onClick={() => setMenuOpen(false)}>Fechar</button>
                 </div>
-            </div>}
+            </Overlay>}
 
-            {showInstall && <div className="overlay" onClick={() => setShowInstall(false)}>
+            {showInstall && <Overlay onClose={() => setShowInstall(false)}>
                 <div className="sheet" onClick={e => e.stopPropagation()}>
                     <div className="sheethead"><h2>Instalar no iPhone</h2><button className="sheetx" aria-label="Fechar" onClick={() => setShowInstall(false)}>✕</button></div>
                     <ol className="install-steps">
@@ -800,9 +990,9 @@ export function App() {
                     <p className="hint">Seus dados ficam salvos neste aparelho, mesmo offline.</p>
                     <button className="sheetbtn ghost" onClick={() => setShowInstall(false)}>Fechar</button>
                 </div>
-            </div>}
+            </Overlay>}
 
-            {preview && <div className="overlay">
+            {preview && <Overlay>
                 <div className="sheet">
                     <div className="sheethead"><h2>Importar de {preview.source}</h2><button className="sheetx" aria-label="Fechar" onClick={() => setPreview(null)}>✕</button></div>
                     <p>{preview.txs.length} lançamentos encontrados
@@ -818,16 +1008,16 @@ export function App() {
                     <button className="sheetbtn primary" onClick={confirmImport}>Importar {preview.txs.length} lançamentos</button>
                     <button className="sheetbtn ghost" onClick={() => setPreview(null)}>Cancelar</button>
                 </div>
-            </div>}
+            </Overlay>}
 
-            {restore && <div className="overlay">
+            {restore && <Overlay>
                 <div className="sheet">
                     <div className="sheethead"><h2>Restaurar backup</h2><button className="sheetx" aria-label="Fechar" onClick={() => setRestore(null)}>✕</button></div>
                     <p>O backup tem {restore.txs.length} lançamentos. Restaurar <strong>substitui</strong> todos os dados atuais deste aparelho.</p>
                     <button className="sheetbtn primary" onClick={confirmRestore}>Substituir e restaurar</button>
                     <button className="sheetbtn ghost" onClick={() => setRestore(null)}>Cancelar</button>
                 </div>
-            </div>}
+            </Overlay>}
 
             {showRecForm && <RecForm
                 key={recEditing ? recEditing.id : 'nova'}
@@ -843,6 +1033,7 @@ export function App() {
                 key={editing ? editing.id : 'novo'}
                 initial={editing}
                 cats={allCats}
+                txs={txs}
                 onSave={saveTx}
                 onDelete={editing ? () => deleteTx(editing.id) : null}
                 onAddCategory={addCategory}
@@ -861,9 +1052,81 @@ export function App() {
 
 // ---------- formulário ----------
 
+// ---------- sugestao automatica de categoria ----------
+// Sugere a categoria enquanto digita a descricao: (1) historico do proprio
+// usuario (descricao igual ou parecida, mais recente/frequente vence — aprende
+// com as correcoes dele, pois elas viram lancamentos), (2) palavras-chave
+// simples. Tudo local, sem servico externo.
+function normTxt(s: string): string {
+    return s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+const CAT_KEYWORDS: Array<[RegExp, string[]]> = [
+    [/\b(uber|99|taxi|onibus|metro|gasolina|combustivel|estacionamento|pedagio|passagem)\b/, ['transporte']],
+    [/\b(remedio|remedios|farmacia|medicamento|consulta|medico|dentista|exame|plano de saude)\b/, ['saude']],
+    [/\b(mercado|supermercado|atacadao|feira|acougue|hortifruti)\b/, ['supermercado']],
+    [/\b(ifood|lanche|hamburguer|pizza|delivery|mcdonalds|burger)\b/, ['ifood/lanche', 'restaurante']],
+    [/\b(restaurante|almoco|jantar|rodizio|marmita|self.?service)\b/, ['restaurante', 'ifood/lanche']],
+    [/\b(luz|energia|equatorial)\b/, ['luz']],
+    [/\b(agua|saneamento|cosanpa)\b/, ['agua']],
+    [/\b(internet|fibra|banda larga|wifi)\b/, ['internet']],
+    [/\b(telefone|celular|recarga|tim|claro|vivo|oi)\b/, ['telefone']],
+    [/\b(netflix|spotify|disney|hbo|prime video|youtube|streaming|globoplay)\b/, ['streaming']],
+    [/\b(curso|escola|faculdade|mensalidade|udemy|alura)\b/, ['educacao']],
+    [/\b(livro|livros|livraria|kindle)\b/, ['livros', 'educacao']],
+    [/\b(aluguel|alugueis)\b/, ['aluguel', 'casa']],
+    [/\b(fatura|cartao de credito)\b/, ['fatura cartao']],
+    [/\b(tarifa|anuidade|manutencao de conta)\b/, ['tarifa bancaria']],
+    [/\b(dizimo|oferta|igreja)\b/, ['dizimo e ofertas']],
+    [/\b(emprestimo|consignado)\b/, ['emprestimo']],
+    [/\b(bitcoin|btc|cripto|binance)\b/, ['bitcoin', 'investimentos']],
+    [/\b(salario|pagamento|prolabore)\b/, ['salario']],
+    [/\b(freelance|freela|bico)\b/, ['freelance']],
+    [/\b(presente|aniversario)\b/, ['presente']],
+    [/\b(investimento|aplicacao|rendimento|dividendos|cdb|tesouro)\b/, ['investimentos']],
+];
+
+function suggestCategory(desc: string, txs: Tx[], cats: Category[], type: TxType): string | null {
+    const q = normTxt(desc);
+    if (q.length < 3) return null;
+    const eligible = new Set(cats.filter(c => c.type === type || c.type === 'ambos').map(c => c.id));
+    const byNormLabel = new Map(cats.map(c => [normTxt(c.label), c.id]));
+    // historico: exato (mais recente) > voto por prefixo (frequencia, depois recencia)
+    let exact: string | null = null; let exactDate = '';
+    const votes = new Map<string, { n: number; recent: string }>();
+    for (const t of txs) {
+        if (t.type !== type || !eligible.has(t.cat)) continue;
+        const n = normTxt(t.desc);
+        if (!n) continue;
+        if (n === q) {
+            if (t.date >= exactDate) { exactDate = t.date; exact = t.cat; }
+        } else if (n.startsWith(q) || (q.length >= 4 && q.startsWith(n) && n.length >= 3)) {
+            const v = votes.get(t.cat) || { n: 0, recent: '' };
+            v.n += 1; if (t.date > v.recent) v.recent = t.date;
+            votes.set(t.cat, v);
+        }
+    }
+    if (exact) return exact;
+    let voteBest: string | null = null; let voteN = 0; let voteRecent = '';
+    for (const [catId, v] of votes) {
+        if (v.n > voteN || (v.n === voteN && v.recent > voteRecent)) { voteBest = catId; voteN = v.n; voteRecent = v.recent; }
+    }
+    if (voteBest) return voteBest;
+    for (const [re, labels] of CAT_KEYWORDS) {
+        if (re.test(q)) {
+            for (const l of labels) {
+                const id = byNormLabel.get(l);
+                if (id && eligible.has(id)) return id;
+            }
+        }
+    }
+    return null;
+}
+
 function TxForm(props: {
     initial: Tx | null;
     cats: Category[];
+    txs: Tx[];
     onSave: (tx: Tx) => void;
     onDelete: (() => void) | null;
     onAddCategory: (label: string, type: TxType) => string;
@@ -880,7 +1143,12 @@ function TxForm(props: {
     const [err, setErr] = useState('');
 
     const cats = props.cats.filter(c => c.type === type || c.type === 'ambos');
-    const chosenCat = cat || (type === 'despesa' ? 'outros-d' : 'outros-r');
+    const [catTouched, setCatTouched] = useState(!!initial);
+    const suggested = useMemo(
+        () => (catTouched ? null : suggestCategory(desc, props.txs, props.cats, type)),
+        [desc, props.txs, props.cats, type, catTouched],
+    );
+    const chosenCat = cat || suggested || (type === 'despesa' ? 'outros-d' : 'outros-r');
 
     const submit = () => {
         const cents = parseBRValue(valor);
@@ -897,7 +1165,7 @@ function TxForm(props: {
         });
     };
 
-    return <div className="overlay">
+    return <Overlay>
         <div className="sheet form">
             <div className="sheethead"><h2>{initial ? 'Editar lançamento' : 'Novo lançamento'}</h2><button className="sheetx" aria-label="Fechar" onClick={props.onClose}>✕</button></div>
             <div className="typetoggle">
@@ -915,13 +1183,14 @@ function TxForm(props: {
             <div className="field">
                 <span>Categoria</span>
                 <div className="catchips">
-                    {cats.map(c => <button key={c.id} className={'chip' + (chosenCat === c.id ? ' sel' : '')} onClick={() => setCat(c.id)}>
+                    {cats.map(c => <button key={c.id} className={'chip' + (chosenCat === c.id ? ' sel' : '')} onClick={() => { setCat(c.id); setCatTouched(true); }}>
                         {c.icon} {c.label}
                     </button>)}
                 </div>
+                {!cat && suggested && <p className="hint">Categoria sugerida pela descrição — toque em outra para mudar.</p>}
                 <div className="newcat">
                     <input type="text" placeholder="Nova categoria…" value={novaCat} onChange={e => setNovaCat(e.target.value)} />
-                    <button className="chip" disabled={!novaCat.trim()} onClick={() => { const id = props.onAddCategory(novaCat.trim(), type); setCat(id); setNovaCat(''); }}>Adicionar</button>
+                    <button className="chip" disabled={!novaCat.trim()} onClick={() => { const id = props.onAddCategory(novaCat.trim(), type); setCat(id); setCatTouched(true); setNovaCat(''); }}>Adicionar</button>
                 </div>
             </div>
             <label className="field">
@@ -935,7 +1204,7 @@ function TxForm(props: {
             </button>}
             <button className="sheetbtn ghost" onClick={props.onClose}>Cancelar</button>
         </div>
-    </div>;
+    </Overlay>;
 }
 
 
@@ -969,7 +1238,7 @@ function RecForm(props: {
         props.onSave({ id: initial ? initial.id : uid(), desc: desc.trim(), cat: chosenCat, cents, dueDay });
     };
 
-    return <div className="overlay">
+    return <Overlay>
         <div className="sheet form">
             <div className="sheethead"><h2>{initial ? 'Editar conta fixa' : 'Nova conta fixa'}</h2><button className="sheetx" aria-label="Fechar" onClick={props.onClose}>✕</button></div>
             <label className="field">
@@ -1003,5 +1272,5 @@ function RecForm(props: {
             </button>}
             <button className="sheetbtn ghost" onClick={props.onClose}>Cancelar</button>
         </div>
-    </div>;
+    </Overlay>;
 }
