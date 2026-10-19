@@ -34,6 +34,17 @@ interface Category {
     type: TxType | 'ambos';
 }
 
+// Associacao aprendida: descricao normalizada -> categoria. Editavel pelo usuario
+// em "Categorias e sugestões" (menu). at = data do lancamento que a gerou (para
+// desempate por recencia e limpeza das mais antigas).
+interface CatRule {
+    key: string; // normTxt(desc)
+    desc: string; // descricao original, para exibir
+    cat: string;
+    type: TxType;
+    at: string; // YYYY-MM-DD
+}
+
 // ---------- constantes ----------
 
 const DEFAULT_CATS: Category[] = [
@@ -511,21 +522,26 @@ export function App() {
     txsRef.current = txs;
     const [cats, setCats, catsSaved] = useLocalState('mf.cats.v1', [] as Category[]);
     const [recs, setRecs, recsSaved] = useLocalState('mf.recs.v1', SEED_RECS);
+    const [catRules, setCatRules, rulesSaved] = useLocalState('mf.catrules.v1', [] as CatRule[]);
+    const [rulesSeeded, setRulesSeeded] = useLocalState('mf.catrules.seeded.v1', '');
+    const catRulesRef = useRef<CatRule[]>([]);
+    catRulesRef.current = catRules;
     const [recEditing, setRecEditing] = useState<Rec | null>(null);
     const [showRecForm, setShowRecForm] = useState(false);
     const [recUndoKey, setRecUndoKey] = useState('');
     const [theme, setTheme, themeSaved] = useLocalState('mf.theme.v1', 'light' as 'light' | 'dark');
-    const storeReady = !!(txsSaved && txsSaved.ready && catsSaved && catsSaved.ready && themeSaved && themeSaved.ready && recsSaved && recsSaved.ready);
-    const storeMessage = Array.from(new Set([txsSaved && txsSaved.message, catsSaved && catsSaved.message, themeSaved && themeSaved.message, recsSaved && recsSaved.message].filter(Boolean))).join(' ');
+    const storeReady = !!(txsSaved && txsSaved.ready && catsSaved && catsSaved.ready && themeSaved && themeSaved.ready && recsSaved && recsSaved.ready && rulesSaved && rulesSaved.ready);
+    const storeMessage = Array.from(new Set([txsSaved && txsSaved.message, catsSaved && catsSaved.message, themeSaved && themeSaved.message, recsSaved && recsSaved.message, rulesSaved && rulesSaved.message].filter(Boolean))).join(' ');
     const now = new Date();
     const [month, setMonth] = useState({ y: now.getFullYear(), m: now.getMonth() });
     const [showForm, setShowForm] = useState(false);
     const [editing, setEditing] = useState<Tx | null>(null);
     const [menuOpen, setMenuOpen] = useState(false);
+    const [showCatRules, setShowCatRules] = useState(false);
     const [selCat, setSelCat] = useState<string | null>(null);
     const [showInstall, setShowInstall] = useState(false);
     const [preview, setPreview] = useState<ImportPreview | null>(null);
-    const [restore, setRestore] = useState<{ txs: Tx[]; cats: Category[] } | null>(null);
+    const [restore, setRestore] = useState<{ txs: Tx[]; cats: Category[]; rules?: CatRule[] } | null>(null);
     const [notice, setNotice] = useState('');
     const importInput = useRef<HTMLInputElement>(null);
     const restoreInput = useRef<HTMLInputElement>(null);
@@ -658,6 +674,7 @@ export function App() {
     const saveTx = (tx: Tx) => {
         const exists = txs.some(t => t.id === tx.id);
         if (!persistTxs(exists ? txs.map(t => (t.id === tx.id ? tx : t)) : [tx, ...txs])) return;
+        learnFromTxs([tx]);
         setShowForm(false);
         setEditing(null);
     };
@@ -677,7 +694,9 @@ export function App() {
         const daysInMonth = new Date(month.y, month.m + 1, 0).getDate();
         const day = Math.min(r.dueDay, daysInMonth);
         const date = monthKey + '-' + String(day).padStart(2, '0');
-        if (!persistTxs([{ id: uid(), type: 'despesa', desc: r.desc, cat: r.cat, cents: r.cents, date, recKey: key }, ...txs])) return;
+        const paidTx: Tx = { id: uid(), type: 'despesa', desc: r.desc, cat: r.cat, cents: r.cents, date, recKey: key };
+        if (!persistTxs([paidTx, ...txs])) return;
+        learnFromTxs([paidTx]);
         setNotice(r.desc + ' marcada como paga.');
     };
 
@@ -711,8 +730,53 @@ export function App() {
         return id;
     };
 
+    // Aprendizado de categorias: toda gravacao de lancamento vira/atualiza uma
+    // associacao descricao -> categoria. O usuario consulta e edita em
+    // "Categorias e sugestões". Mantem no maximo 400, descartando as mais antigas.
+    const learnFromTxs = (list: Tx[]) => {
+        const add = new Map<string, CatRule>();
+        for (const t of list) {
+            const key = normTxt(t.desc);
+            if (key.length < 3) continue;
+            add.set(t.type + '|' + key, { key, desc: t.desc.trim(), cat: t.cat, type: t.type, at: t.date });
+        }
+        if (!add.size) return;
+        const merged = catRulesRef.current.filter(r => !add.has(r.type + '|' + r.key));
+        const next = [...add.values(), ...merged].sort((a, b) => b.at.localeCompare(a.at));
+        setCatRules(next.slice(0, 400));
+    };
+
+    // Semeia as associacoes a partir do historico existente (uma vez por aparelho).
+    useEffect(() => {
+        if (!storeReady || rulesSeeded !== '') return;
+        const byKey = new Map<string, CatRule>();
+        for (const t of txs) {
+            const key = normTxt(t.desc);
+            if (key.length < 3) continue;
+            const k = t.type + '|' + key;
+            const prev = byKey.get(k);
+            if (!prev || t.date >= prev.at) byKey.set(k, { key, desc: t.desc, cat: t.cat, type: t.type, at: t.date });
+        }
+        const derived = Array.from(byKey.values()).sort((a, b) => b.at.localeCompare(a.at)).slice(0, 400);
+        if (derived.length && catRulesRef.current.length === 0) setCatRules(derived);
+        setRulesSeeded('done');
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [storeReady, rulesSeeded]);
+
+    const saveRule = (rule: CatRule, applyPast: boolean) => {
+        const affected = applyPast ? txs.filter(t => t.type === rule.type && normTxt(t.desc) === rule.key && t.cat !== rule.cat) : [];
+        if (affected.length && !persistTxs(txs.map(t => affected.some(a => a.id === t.id) ? { ...t, cat: rule.cat } : t))) return;
+        setCatRules(catRulesRef.current.map(r => (r.key === rule.key && r.type === rule.type) ? rule : r));
+        setNotice(affected.length ? 'Sugestão e ' + affected.length + ' ' + (affected.length === 1 ? 'lançamento anterior atualizado.' : 'lançamentos anteriores atualizados.') : 'Sugestão atualizada.');
+    };
+
+    const forgetRule = (rule: CatRule) => {
+        setCatRules(catRulesRef.current.filter(r => !(r.key === rule.key && r.type === rule.type)));
+        setNotice('Sugestão esquecida. As palavras-chave do app ainda podem sugerir uma categoria.');
+    };
+
     const exportBackup = () => {
-        const payload = { app: 'minhas-financas', version: 1, exportedAt: new Date().toISOString(), txs, cats };
+        const payload = { app: 'minhas-financas', version: 1, exportedAt: new Date().toISOString(), txs, cats, rules: catRulesRef.current };
         const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
@@ -782,6 +846,7 @@ export function App() {
             }
         }
         if (!persistTxs([...txs, ...mappedTxs])) return;
+        learnFromTxs(mappedTxs);
         if (newCats.length) setCats([...cats, ...newCats]);
         setMonth({ y: new Date(mappedTxs[0].date + 'T12:00:00').getFullYear(), m: new Date(mappedTxs[0].date + 'T12:00:00').getMonth() });
         setNotice(preview.txs.length + ' lançamentos importados' + (preview.skipped ? ' (' + preview.skipped + ' duplicados ignorados)' : '') + '.');
@@ -792,7 +857,7 @@ export function App() {
         try {
             const parsed = JSON.parse(await file.text());
             if (!parsed || parsed.app !== 'minhas-financas' || !Array.isArray(parsed.txs)) throw new Error('Esse arquivo não é um backup do Minhas Finanças.');
-            setRestore({ txs: parsed.txs, cats: Array.isArray(parsed.cats) ? parsed.cats : [] });
+            setRestore({ txs: parsed.txs, cats: Array.isArray(parsed.cats) ? parsed.cats : [], rules: Array.isArray(parsed.rules) ? parsed.rules : undefined });
         } catch (e: any) {
             setNotice(e && e.message ? e.message : 'Não consegui ler o backup.');
         }
@@ -803,6 +868,7 @@ export function App() {
         if (!restore) return;
         if (!persistTxs(restore.txs)) return;
         setCats(restore.cats);
+        if (restore.rules) setCatRules(restore.rules);
         setRestore(null);
         setNotice('Backup restaurado.');
     };
@@ -970,6 +1036,7 @@ export function App() {
             {menuOpen && <Overlay onClose={() => setMenuOpen(false)}>
                 <div className="sheet" onClick={e => e.stopPropagation()}>
                     <div className="sheethead"><h2>Opções</h2><button className="sheetx" aria-label="Fechar" onClick={() => setMenuOpen(false)}>✕</button></div>
+                    <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowCatRules(true); }}>🏷️ Categorias e sugestões</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); importInput.current && importInput.current.click(); }}>📥 Importar arquivo (Mobills, OFX, CSV)</button>
                     <button className="sheetbtn" onClick={exportBackup}>☁️ Exportar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); restoreInput.current && restoreInput.current.click(); }}>↩️ Restaurar backup</button>
@@ -1019,6 +1086,15 @@ export function App() {
                 </div>
             </Overlay>}
 
+            {showCatRules && <CatRulesSheet
+                rules={catRules}
+                txs={txs}
+                cats={allCats}
+                onSaveRule={saveRule}
+                onForget={forgetRule}
+                onClose={() => setShowCatRules(false)}
+            />}
+
             {showRecForm && <RecForm
                 key={recEditing ? recEditing.id : 'nova'}
                 initial={recEditing}
@@ -1033,7 +1109,7 @@ export function App() {
                 key={editing ? editing.id : 'novo'}
                 initial={editing}
                 cats={allCats}
-                txs={txs}
+                rules={catRules}
                 onSave={saveTx}
                 onDelete={editing ? () => deleteTx(editing.id) : null}
                 onAddCategory={addCategory}
@@ -1086,32 +1162,23 @@ const CAT_KEYWORDS: Array<[RegExp, string[]]> = [
     [/\b(investimento|aplicacao|rendimento|dividendos|cdb|tesouro)\b/, ['investimentos']],
 ];
 
-function suggestCategory(desc: string, txs: Tx[], cats: Category[], type: TxType): string | null {
+function suggestCategory(desc: string, rules: CatRule[], cats: Category[], type: TxType): string | null {
     const q = normTxt(desc);
     if (q.length < 3) return null;
     const eligible = new Set(cats.filter(c => c.type === type || c.type === 'ambos').map(c => c.id));
     const byNormLabel = new Map(cats.map(c => [normTxt(c.label), c.id]));
-    // historico: exato (mais recente) > voto por prefixo (frequencia, depois recencia)
-    let exact: string | null = null; let exactDate = '';
-    const votes = new Map<string, { n: number; recent: string }>();
-    for (const t of txs) {
-        if (t.type !== type || !eligible.has(t.cat)) continue;
-        const n = normTxt(t.desc);
-        if (!n) continue;
-        if (n === q) {
-            if (t.date >= exactDate) { exactDate = t.date; exact = t.cat; }
-        } else if (n.startsWith(q) || (q.length >= 4 && q.startsWith(n) && n.length >= 3)) {
-            const v = votes.get(t.cat) || { n: 0, recent: '' };
-            v.n += 1; if (t.date > v.recent) v.recent = t.date;
-            votes.set(t.cat, v);
+    // aprendizado do usuario: exato (mais recente) > prefixo (mais recente)
+    let exact: CatRule | null = null;
+    let prefix: CatRule | null = null;
+    for (const r of rules) {
+        if (r.type !== type || !eligible.has(r.cat)) continue;
+        if (r.key === q) { if (!exact || r.at >= exact.at) exact = r; }
+        else if (r.key.startsWith(q) || (q.length >= 4 && q.startsWith(r.key) && r.key.length >= 3)) {
+            if (!prefix || r.at > prefix.at) prefix = r;
         }
     }
-    if (exact) return exact;
-    let voteBest: string | null = null; let voteN = 0; let voteRecent = '';
-    for (const [catId, v] of votes) {
-        if (v.n > voteN || (v.n === voteN && v.recent > voteRecent)) { voteBest = catId; voteN = v.n; voteRecent = v.recent; }
-    }
-    if (voteBest) return voteBest;
+    if (exact) return exact.cat;
+    if (prefix) return prefix.cat;
     for (const [re, labels] of CAT_KEYWORDS) {
         if (re.test(q)) {
             for (const l of labels) {
@@ -1126,7 +1193,7 @@ function suggestCategory(desc: string, txs: Tx[], cats: Category[], type: TxType
 function TxForm(props: {
     initial: Tx | null;
     cats: Category[];
-    txs: Tx[];
+    rules: CatRule[];
     onSave: (tx: Tx) => void;
     onDelete: (() => void) | null;
     onAddCategory: (label: string, type: TxType) => string;
@@ -1145,8 +1212,8 @@ function TxForm(props: {
     const cats = props.cats.filter(c => c.type === type || c.type === 'ambos');
     const [catTouched, setCatTouched] = useState(!!initial);
     const suggested = useMemo(
-        () => (catTouched ? null : suggestCategory(desc, props.txs, props.cats, type)),
-        [desc, props.txs, props.cats, type, catTouched],
+        () => (catTouched ? null : suggestCategory(desc, props.rules, props.cats, type)),
+        [desc, props.rules, props.cats, type, catTouched],
     );
     const chosenCat = cat || suggested || (type === 'despesa' ? 'outros-d' : 'outros-r');
 
@@ -1271,6 +1338,119 @@ function RecForm(props: {
                 {confirmDel ? 'Toque de novo para confirmar a exclusão' : 'Remover conta fixa'}
             </button>}
             <button className="sheetbtn ghost" onClick={props.onClose}>Cancelar</button>
+        </div>
+    </Overlay>;
+}
+
+
+// ---------- categorias e sugestões aprendidas ----------
+
+// Tela de consulta e edição do que o app aprendeu: descrição -> categoria.
+// O usuário vê a lista, filtra, muda a categoria de uma descrição (com prévia
+// dos lançamentos antigos que aquilo afetaria) ou esquece a sugestão.
+function CatRulesSheet(props: {
+    rules: CatRule[];
+    txs: Tx[];
+    cats: Category[];
+    onSaveRule: (rule: CatRule, applyPast: boolean) => void;
+    onForget: (rule: CatRule) => void;
+    onClose: () => void;
+}) {
+    const [query, setQuery] = useState('');
+    const [sel, setSel] = useState<CatRule | null>(null);
+    const [cat, setCat] = useState('');
+    const [applyPast, setApplyPast] = useState(false);
+    const [confirmForget, setConfirmForget] = useState(false);
+
+    const catOf = (id: string): Category => props.cats.find(c => c.id === id)
+        || { id, label: id.replace(/^m:/, '').replace(/-/g, ' '), icon: '🏷️', color: '#8a8a8a', type: 'ambos' };
+
+    const counts = useMemo(() => {
+        const m = new Map<string, number>();
+        for (const t of props.txs) {
+            const k = t.type + '|' + normTxt(t.desc);
+            m.set(k, (m.get(k) || 0) + 1);
+        }
+        return m;
+    }, [props.txs]);
+
+    const open = (r: CatRule) => { setSel(r); setCat(r.cat); setApplyPast(false); setConfirmForget(false); };
+
+    if (sel) {
+        const matches = props.txs
+            .filter(t => t.type === sel.type && normTxt(t.desc) === sel.key)
+            .sort((a, b) => b.date.localeCompare(a.date));
+        const changed = cat !== '' && cat !== sel.cat;
+        const affected = changed ? matches.filter(t => t.cat !== cat) : [];
+        const catsForType = props.cats.filter(c => c.type === sel.type || c.type === 'ambos');
+        const save = () => {
+            if (!changed) return;
+            props.onSaveRule({ ...sel, cat }, applyPast);
+            setSel(null);
+        };
+        return <Overlay onClose={props.onClose}>
+            <div className="sheet" onClick={e => e.stopPropagation()}>
+                <div className="sheethead"><h2>{sel.desc}</h2><button className="sheetx" aria-label="Voltar" onClick={() => setSel(null)}>✕</button></div>
+                <p className="hint">{sel.type === 'receita' ? 'Receita' : 'Despesa'} · o app sugere esta descrição como:</p>
+                <div className="catchips">
+                    {catsForType.map(c => <button key={c.id} className={'chip' + (cat === c.id ? ' sel' : '')} onClick={() => setCat(c.id)}>
+                        {c.icon} {c.label}
+                    </button>)}
+                </div>
+                {matches.length > 0 && <>
+                    <h3 className="rules-sub">{matches.length === 1 ? '1 lançamento com essa descrição' : matches.length + ' lançamentos com essa descrição'}</h3>
+                    <div className="preview-list">
+                        {matches.slice(0, 5).map(t => <div className="preview-row" key={t.id}>
+                            <span>{new Date(t.date + 'T12:00:00').toLocaleDateString('pt-BR')}</span>
+                            <span className="preview-desc">{catOf(t.cat).label}</span>
+                            <span className={t.type === 'receita' ? 'pos' : 'neg'}>{t.type === 'receita' ? '+' : '−'} {fmt(t.cents)}</span>
+                        </div>)}
+                        {matches.length > 5 && <p className="hint">… e mais {matches.length - 5}.</p>}
+                    </div>
+                </>}
+                {changed && affected.length > 0 && <label className="checkrow">
+                    <input type="checkbox" checked={applyPast} onChange={e => setApplyPast(e.target.checked)} />
+                    <span>Atualizar também {affected.length === 1 ? 'o 1 lançamento anterior' : 'os ' + affected.length + ' lançamentos anteriores'}</span>
+                </label>}
+                <p className="hint">Mudar aqui vale para os próximos lançamentos{changed && affected.length > 0 ? ', a menos que você marque a opção acima' : ''}.</p>
+                <button className="sheetbtn primary" disabled={!changed} onClick={save}>Salvar</button>
+                <button className="sheetbtn danger" onClick={() => { if (confirmForget) { props.onForget(sel); setSel(null); } else setConfirmForget(true); }}>
+                    {confirmForget ? 'Toque de novo para confirmar' : 'Esquecer esta sugestão'}
+                </button>
+                <button className="sheetbtn ghost" onClick={() => setSel(null)}>Voltar</button>
+            </div>
+        </Overlay>;
+    }
+
+    const q = normTxt(query);
+    const filtered = props.rules.filter(r => !q || r.key.includes(q) || normTxt(catOf(r.cat).label).includes(q));
+    const shown = filtered.slice(0, 60);
+    return <Overlay onClose={props.onClose}>
+        <div className="sheet" onClick={e => e.stopPropagation()}>
+            <div className="sheethead"><h2>Categorias e sugestões</h2><button className="sheetx" aria-label="Fechar" onClick={props.onClose}>✕</button></div>
+            <p className="hint">O app aprende a categoria pela descrição dos seus lançamentos. Toque numa descrição para ver, mudar ou esquecer a sugestão.</p>
+            {props.rules.length > 8 && <div className="field">
+                <input type="text" placeholder="Buscar descrição ou categoria…" value={query} onChange={e => setQuery(e.target.value)} />
+            </div>}
+            {shown.length === 0 && <p className="hint">{props.rules.length === 0
+                ? 'Nenhuma sugestão aprendida ainda. O app aprende sozinho quando você salva um lançamento.'
+                : 'Nada encontrado para essa busca.'}</p>}
+            <div className="rules-list">
+                {shown.map(r => {
+                    const c = catOf(r.cat);
+                    const n = counts.get(r.type + '|' + r.key) || 0;
+                    return <button className="rule" key={r.type + '|' + r.key} onClick={() => open(r)}>
+                        <span className="tx-icon" style={{ background: c.color + '22' }}>{c.icon}</span>
+                        <span className="rule-main">
+                            <span className="rule-desc">{r.desc}</span>
+                            <span className="rule-cat">{r.type === 'receita' ? 'Receita · ' : ''}{c.label}{n > 0 ? ' · ' + n + (n === 1 ? ' lançamento' : ' lançamentos') : ''}</span>
+                        </span>
+                        <span className="rule-arrow">›</span>
+                    </button>;
+                })}
+            </div>
+            {filtered.length > shown.length && <p className="hint">… e mais {filtered.length - shown.length}. Use a busca para filtrar.</p>}
+            <button className="sheetbtn ghost" onClick={props.onClose}>Fechar</button>
         </div>
     </Overlay>;
 }
