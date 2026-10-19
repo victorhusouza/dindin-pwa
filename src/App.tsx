@@ -542,6 +542,9 @@ export function App() {
     const [showInstall, setShowInstall] = useState(false);
     const [preview, setPreview] = useState<ImportPreview | null>(null);
     const [restore, setRestore] = useState<{ txs: Tx[]; cats: Category[]; rules?: CatRule[] } | null>(null);
+    const [exportMessage, setExportMessage] = useState('');
+    const [exportData, setExportData] = useState<{ url: string; json: string; file: File | null; canShare: boolean } | null>(null);
+    const exportTaRef = useRef<HTMLTextAreaElement | null>(null);
     const [notice, setNotice] = useState('');
     const importInput = useRef<HTMLInputElement>(null);
     const restoreInput = useRef<HTMLInputElement>(null);
@@ -775,17 +778,73 @@ export function App() {
         setNotice('Sugestão esquecida. As palavras-chave do app ainda podem sugerir uma categoria.');
     };
 
+    // O app roda num iframe sem permissao de download, entao o clique num link
+    // de download pode ser bloqueado sem aviso. Por isso o backup abre uma
+    // folha com varias saidas: compartilhar (iPhone), baixar, abrir em nova
+    // aba (escapa do iframe) ou copiar o conteudo.
     const exportBackup = () => {
         const payload = { app: 'minhas-financas', version: 1, exportedAt: new Date().toISOString(), txs, cats, rules: catRulesRef.current };
-        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+        const json = JSON.stringify(payload, null, 2);
+        const blob = new Blob([json], { type: 'application/json' });
+        let file: File | null = null;
+        let canShare = false;
+        try {
+            file = new File([blob], 'minhas-financas-backup.json', { type: 'application/json' });
+            canShare = typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] });
+        } catch { file = null; canShare = false; }
+        if (exportData) URL.revokeObjectURL(exportData.url);
+        setExportMessage('');
+        setExportData({ url: URL.createObjectURL(blob), json, file, canShare });
+        setMenuOpen(false);
+    };
+
+    const closeExport = () => {
+        if (exportData) URL.revokeObjectURL(exportData.url);
+        setExportData(null);
+    };
+
+    const downloadBackup = () => {
+        if (!exportData) return;
         const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
+        a.href = exportData.url;
         a.download = 'minhas-financas-backup.json';
         document.body.appendChild(a);
         a.click();
         a.remove();
-        setMenuOpen(false);
-        setNotice('Backup gerado. Guarde o arquivo no iCloud ou no Drive.');
+        setNotice('Se o download não começou, use Compartilhar ou Copiar nesta tela.');
+    };
+
+    const shareBackup = async () => {
+        if (!exportData || !exportData.file) return;
+        try {
+            await navigator.share({ files: [exportData.file], title: 'Backup Minhas Finanças' });
+            setNotice('Backup compartilhado. Guarde o arquivo no iCloud ou no Drive.');
+            closeExport();
+        } catch (e) {
+            if (e && (e as Error).name === 'AbortError') return; // usuario cancelou a partilha
+            setNotice('Não consegui compartilhar. Tente Baixar ou Copiar o backup.');
+        }
+    };
+
+    const openBackupTab = () => {
+        if (!exportData) return;
+        const w = window.open(exportData.url, '_blank');
+        setExportMessage(w ? 'Confira a nova aba e salve o arquivo. No Mac: ⌘S. No iPhone: Compartilhar > Salvar em Arquivos.' : 'A nova aba foi bloqueada. Use Copiar conteúdo abaixo.');
+    };
+
+    const copyBackup = async () => {
+        if (!exportData) return;
+        try {
+            await navigator.clipboard.writeText(exportData.json);
+            setExportMessage('Backup copiado. Cole em um arquivo de texto e salve com o nome minhas-financas-backup.json.');
+        } catch {
+            const ta = exportTaRef.current;
+            if (ta) {
+                ta.focus(); ta.select(); ta.setSelectionRange(0, ta.value.length);
+                try { if (document.execCommand('copy')) { setExportMessage('Backup copiado. Cole em um arquivo de texto e salve como minhas-financas-backup.json.'); return; } } catch { /* selecao manual abaixo */ }
+            }
+            setExportMessage('Texto selecionado. Copie com ⌘C no Mac ou toque em Copiar no iPhone.');
+        }
     };
 
     const onImportFile = async (file: File) => {
@@ -1043,6 +1102,21 @@ export function App() {
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowInstall(true); }}>📲 Instalar na tela de início</button>
                     <StorageMeter txs={txs} cats={cats} recs={recs} />
                     <button className="sheetbtn ghost" onClick={() => setMenuOpen(false)}>Fechar</button>
+                </div>
+            </Overlay>}
+
+            {exportData && <Overlay onClose={closeExport}>
+                <div className="sheet" onClick={e => e.stopPropagation()}>
+                    <div className="sheethead"><h2>Backup pronto</h2><button className="sheetx" aria-label="Fechar" onClick={closeExport}>✕</button></div>
+                    <p className="hint">São {txs.length} lançamentos. Escolha como guardar o arquivo:</p>
+                    {exportData.canShare && <button className="sheetbtn primary" onClick={shareBackup}>📤 Compartilhar arquivo (Drive, Arquivos…)</button>}
+                    {window.parent === window && <button className="sheetbtn" onClick={downloadBackup}>⬇️ Baixar arquivo</button>}
+                    <button className={'sheetbtn' + (exportData.canShare ? '' : ' primary')} onClick={openBackupTab}>📄 Abrir arquivo para salvar</button>
+                    <button className="sheetbtn" onClick={copyBackup}>📋 Copiar conteúdo</button>
+                    <textarea ref={exportTaRef} className="backuptext" readOnly value={exportData.json} onFocus={e => e.currentTarget.select()} aria-label="Conteúdo do backup" />
+                    <p className="hint">Abra o arquivo em outra aba. No Mac, salve com ⌘S; no iPhone, use Compartilhar &gt; Salvar em Arquivos. Este backup ainda não tem senha.</p>
+                    {exportMessage && <p className="hint" role="status">{exportMessage}</p>}
+                    <button className="sheetbtn ghost" onClick={closeExport}>Fechar</button>
                 </div>
             </Overlay>}
 
