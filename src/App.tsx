@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocalState } from './localState';
+import { decryptBackupJson, encryptBackupJson, isEncryptedBackup } from './crypto';
 import './style.css';
 import heroImg from './photos/hero.png';
 
@@ -543,7 +544,14 @@ export function App() {
     const [preview, setPreview] = useState<ImportPreview | null>(null);
     const [restore, setRestore] = useState<{ txs: Tx[]; cats: Category[]; rules?: CatRule[] } | null>(null);
     const [exportMessage, setExportMessage] = useState('');
-    const [exportData, setExportData] = useState<{ url: string; json: string; file: File | null; canShare: boolean } | null>(null);
+    const [exportData, setExportData] = useState<{ url: string; json: string; file: File | null; canShare: boolean; encrypted: boolean; filename: string } | null>(null);
+    const [showExportChoice, setShowExportChoice] = useState(false);
+    const [showExportPw, setShowExportPw] = useState(false);
+    const [exportPwBusy, setExportPwBusy] = useState(false);
+    const [exportPwErr, setExportPwErr] = useState('');
+    const [encRestore, setEncRestore] = useState<{ text: string } | null>(null);
+    const [decBusy, setDecBusy] = useState(false);
+    const [decErr, setDecErr] = useState('');
     const exportTaRef = useRef<HTMLTextAreaElement | null>(null);
     const [notice, setNotice] = useState('');
     const importInput = useRef<HTMLInputElement>(null);
@@ -782,20 +790,34 @@ export function App() {
     // de download pode ser bloqueado sem aviso. Por isso o backup abre uma
     // folha com varias saidas: compartilhar (iPhone), baixar, abrir em nova
     // aba (escapa do iframe) ou copiar o conteudo.
-    const exportBackup = () => {
-        const payload = { app: 'minhas-financas', version: 1, exportedAt: new Date().toISOString(), txs, cats, rules: catRulesRef.current };
-        const json = JSON.stringify(payload, null, 2);
+    const buildBackupJson = () => JSON.stringify({ app: 'minhas-financas', version: 1, exportedAt: new Date().toISOString(), txs, cats, rules: catRulesRef.current }, null, 2);
+
+    const openExportSheet = (json: string, encrypted: boolean) => {
+        const filename = encrypted ? 'minhas-financas-backup-protegido.json' : 'minhas-financas-backup.json';
         const blob = new Blob([json], { type: 'application/json' });
         let file: File | null = null;
         let canShare = false;
         try {
-            file = new File([blob], 'minhas-financas-backup.json', { type: 'application/json' });
+            file = new File([blob], filename, { type: 'application/json' });
             canShare = typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] });
         } catch { file = null; canShare = false; }
         if (exportData) URL.revokeObjectURL(exportData.url);
         setExportMessage('');
-        setExportData({ url: URL.createObjectURL(blob), json, file, canShare });
+        setExportData({ url: URL.createObjectURL(blob), json, file, canShare, encrypted, filename });
         setMenuOpen(false);
+    };
+
+    const submitExportPw = async (pw: string) => {
+        setExportPwBusy(true);
+        setExportPwErr('');
+        try {
+            const encJson = await encryptBackupJson(buildBackupJson(), pw);
+            setShowExportPw(false);
+            openExportSheet(encJson, true);
+        } catch {
+            setExportPwErr('Seu navegador não conseguiu criptografar. Tente o backup sem senha.');
+        }
+        setExportPwBusy(false);
     };
 
     const closeExport = () => {
@@ -807,7 +829,7 @@ export function App() {
         if (!exportData) return;
         const a = document.createElement('a');
         a.href = exportData.url;
-        a.download = 'minhas-financas-backup.json';
+        a.download = exportData.filename;
         document.body.appendChild(a);
         a.click();
         a.remove();
@@ -914,13 +936,38 @@ export function App() {
 
     const onRestoreFile = async (file: File) => {
         try {
-            const parsed = JSON.parse(await file.text());
-            if (!parsed || parsed.app !== 'minhas-financas' || !Array.isArray(parsed.txs)) throw new Error('Esse arquivo não é um backup do Minhas Finanças.');
-            setRestore({ txs: parsed.txs, cats: Array.isArray(parsed.cats) ? parsed.cats : [], rules: Array.isArray(parsed.rules) ? parsed.rules : undefined });
+            const text = await file.text();
+            let parsed: any;
+            try { parsed = JSON.parse(text); } catch { throw new Error('Esse arquivo não é um backup do Minhas Finanças.'); }
+            if (parsed && parsed.app === 'minhas-financas' && parsed.encrypted === true) {
+                if (!isEncryptedBackup(parsed)) throw new Error('Esse backup protegido está incompleto ou corrompido.');
+                setDecErr('');
+                setEncRestore({ text });
+            } else {
+                if (!parsed || parsed.app !== 'minhas-financas' || !Array.isArray(parsed.txs)) throw new Error('Esse arquivo não é um backup do Minhas Finanças.');
+                setRestore({ txs: parsed.txs, cats: Array.isArray(parsed.cats) ? parsed.cats : [], rules: Array.isArray(parsed.rules) ? parsed.rules : undefined });
+            }
         } catch (e: any) {
             setNotice(e && e.message ? e.message : 'Não consegui ler o backup.');
         }
         if (restoreInput.current) restoreInput.current.value = '';
+    };
+
+    const submitDecrypt = async (pw: string) => {
+        if (!encRestore) return;
+        setDecBusy(true);
+        setDecErr('');
+        try {
+            const plainJson = await decryptBackupJson(encRestore.text, pw);
+            const parsed = JSON.parse(plainJson);
+            if (!parsed || parsed.app !== 'minhas-financas' || !Array.isArray(parsed.txs)) throw new Error('formato');
+            setEncRestore(null);
+            setRestore({ txs: parsed.txs, cats: Array.isArray(parsed.cats) ? parsed.cats : [], rules: Array.isArray(parsed.rules) ? parsed.rules : undefined });
+        } catch (e: any) {
+            if (e && e.message === 'senha') setDecErr('Senha incorreta ou arquivo adulterado. Confira a senha e tente de novo.');
+            else setDecErr('Não consegui abrir este backup. O arquivo pode estar corrompido.');
+        }
+        setDecBusy(false);
     };
 
     const confirmRestore = () => {
@@ -1097,13 +1144,29 @@ export function App() {
                     <div className="sheethead"><h2>Opções</h2><button className="sheetx" aria-label="Fechar" onClick={() => setMenuOpen(false)}>✕</button></div>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowCatRules(true); }}>🏷️ Categorias e sugestões</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); importInput.current && importInput.current.click(); }}>📥 Importar arquivo (Mobills, OFX, CSV)</button>
-                    <button className="sheetbtn" onClick={exportBackup}>☁️ Exportar backup</button>
+                    <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowExportChoice(true); }}>☁️ Exportar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); restoreInput.current && restoreInput.current.click(); }}>↩️ Restaurar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowInstall(true); }}>📲 Instalar na tela de início</button>
                     <StorageMeter txs={txs} cats={cats} recs={recs} />
                     <button className="sheetbtn ghost" onClick={() => setMenuOpen(false)}>Fechar</button>
                 </div>
             </Overlay>}
+
+            {showExportChoice && <Overlay onClose={() => setShowExportChoice(false)}>
+                <div className="sheet" onClick={e => e.stopPropagation()}>
+                    <div className="sheethead"><h2>Exportar backup</h2><button className="sheetx" aria-label="Fechar" onClick={() => setShowExportChoice(false)}>✕</button></div>
+                    <p className="hint">São {txs.length} lançamentos. Como você quer guardar o arquivo?</p>
+                    <button className="sheetbtn primary" onClick={() => { setShowExportChoice(false); setExportPwErr(''); setShowExportPw(true); }}>🔒 Protegido com senha (recomendado)</button>
+                    <p className="hint">Criptografado (AES-256): nem quem pegar o arquivo consegue ler. A senha é sua, fica só no seu gerenciador de senhas.</p>
+                    <button className="sheetbtn" onClick={() => { setShowExportChoice(false); openExportSheet(buildBackupJson(), false); }}>📄 Sem senha</button>
+                    <p className="hint">Arquivo aberto: qualquer pessoa com o arquivo lê seus lançamentos.</p>
+                    <button className="sheetbtn ghost" onClick={() => setShowExportChoice(false)}>Cancelar</button>
+                </div>
+            </Overlay>}
+
+            {showExportPw && <ExportPasswordSheet busy={exportPwBusy} err={exportPwErr} onSubmit={pw => { void submitExportPw(pw); }} onClose={() => setShowExportPw(false)} />}
+
+            {encRestore && <DecryptBackupSheet busy={decBusy} err={decErr} onSubmit={pw => { void submitDecrypt(pw); }} onClose={() => setEncRestore(null)} />}
 
             {exportData && <Overlay onClose={closeExport}>
                 <div className="sheet" onClick={e => e.stopPropagation()}>
@@ -1114,7 +1177,8 @@ export function App() {
                     <button className={'sheetbtn' + (exportData.canShare ? '' : ' primary')} onClick={openBackupTab}>📄 Abrir arquivo para salvar</button>
                     <button className="sheetbtn" onClick={copyBackup}>📋 Copiar conteúdo</button>
                     <textarea ref={exportTaRef} className="backuptext" readOnly value={exportData.json} onFocus={e => e.currentTarget.select()} aria-label="Conteúdo do backup" />
-                    <p className="hint">Abra o arquivo em outra aba. No Mac, salve com ⌘S; no iPhone, use Compartilhar &gt; Salvar em Arquivos. Este backup ainda não tem senha.</p>
+                    <p className="hint">Abra o arquivo em outra aba. No Mac, salve com ⌘S; no iPhone, use Compartilhar &gt; Salvar em Arquivos.</p>
+                    <p className="hint">{exportData.encrypted ? 'Backup protegido com senha (AES-256). Sem a senha não tem como abrir: guarde-a no seu gerenciador de senhas.' : 'Este backup não tem senha: qualquer pessoa com o arquivo consegue ler.'}</p>
                     {exportMessage && <p className="hint" role="status">{exportMessage}</p>}
                     <button className="sheetbtn ghost" onClick={closeExport}>Fechar</button>
                 </div>
@@ -1198,6 +1262,54 @@ export function App() {
                 onChange={e => { const f = e.target.files && e.target.files[0]; if (f) void onRestoreFile(f); }} />
         </div>
     </>;
+}
+
+// ---------- senha do backup (exportar e restaurar) ----------
+
+function ExportPasswordSheet(props: { busy: boolean; err: string; onSubmit: (pw: string) => void; onClose: () => void }) {
+    const [pw1, setPw1] = useState('');
+    const [pw2, setPw2] = useState('');
+    const [err, setErr] = useState('');
+    const submit = () => {
+        if (pw1.length < 8) { setErr('Use pelo menos 8 caracteres.'); return; }
+        if (pw1 !== pw2) { setErr('As senhas não são iguais.'); return; }
+        setErr('');
+        props.onSubmit(pw1);
+    };
+    return <Overlay>
+        <div className="sheet form">
+            <div className="sheethead"><h2>Senha do backup</h2><button className="sheetx" aria-label="Fechar" onClick={props.onClose}>✕</button></div>
+            <p className="hint">O arquivo fica criptografado (AES-256). Sem a senha ninguém lê, nem você: guarde-a no seu gerenciador de senhas.</p>
+            <label className="field">
+                <span>Senha</span>
+                <input type="password" autoComplete="new-password" value={pw1} onChange={e => setPw1(e.target.value)} autoFocus />
+            </label>
+            <label className="field">
+                <span>Repita a senha</span>
+                <input type="password" autoComplete="new-password" value={pw2} onChange={e => setPw2(e.target.value)} />
+            </label>
+            {(err || props.err) && <p className="error">{err || props.err}</p>}
+            <button className="sheetbtn primary" disabled={props.busy} onClick={submit}>{props.busy ? 'Criptografando…' : 'Criar backup protegido'}</button>
+            <button className="sheetbtn ghost" onClick={props.onClose}>Cancelar</button>
+        </div>
+    </Overlay>;
+}
+
+function DecryptBackupSheet(props: { busy: boolean; err: string; onSubmit: (pw: string) => void; onClose: () => void }) {
+    const [pw, setPw] = useState('');
+    return <Overlay>
+        <div className="sheet form">
+            <div className="sheethead"><h2>Backup protegido</h2><button className="sheetx" aria-label="Fechar" onClick={props.onClose}>✕</button></div>
+            <p className="hint">Este backup está criptografado. Digite a senha que você usou ao exportar.</p>
+            <label className="field">
+                <span>Senha do backup</span>
+                <input type="password" autoComplete="off" value={pw} onChange={e => setPw(e.target.value)} autoFocus />
+            </label>
+            {props.err && <p className="error">{props.err}</p>}
+            <button className="sheetbtn primary" disabled={props.busy || !pw} onClick={() => props.onSubmit(pw)}>{props.busy ? 'Descriptografando…' : 'Abrir backup'}</button>
+            <button className="sheetbtn ghost" onClick={props.onClose}>Cancelar</button>
+        </div>
+    </Overlay>;
 }
 
 // ---------- formulário ----------
