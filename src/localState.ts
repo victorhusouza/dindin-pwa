@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { notifyChange } from './sync';
 
 // Armazenamento local do navegador (localStorage).
 // Mesma assinatura do hook usado na versão hospedada: [valor, setter, { ready, message }].
@@ -26,6 +27,7 @@ export function useLocalState<T>(key: string, initial: T): [T, (v: T) => boolean
         setValue(v);
         try {
             window.localStorage.setItem(key, JSON.stringify(v));
+            notifyChange(key); // enfileira a mudanca para o sync com a VM
             return true;
         } catch {
             // sem acesso ao armazenamento: mantém só em memória

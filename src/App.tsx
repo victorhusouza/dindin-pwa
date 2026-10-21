@@ -111,8 +111,8 @@ function slug(s: string): string {
 
 // ---------- persistência no aparelho (via viewer) ----------
 
-const CHUNKS = 8;
-const CHUNK_CAP = 11000; // o limite de 16 KiB do viewer mede o valor DEPOIS do escape JSON (~+20%): 11k chars ficam ~13.5 KiB
+const CHUNKS = 32;
+const CHUNK_CAP = 50000; // localStorage do navegador: muito alem do limite de 64 KiB do viewer antigo
 
 function packChunks(s: string): string[] {
     const out: string[] = [];
@@ -122,14 +122,18 @@ function packChunks(s: string): string[] {
 
 // Armazenamento compacto: [data, descricao, categoria, centavos, 'r'|'d', recKey|0].
 // O formato antigo (objetos com id) ainda é lido; na próxima gravação vira compacto.
-type PackedTx = [string, string, string, number, string, string | 0];
+type PackedTx = [string, string, string, string, number, string, string | 0];
 
 function packTx(t: Tx): PackedTx {
-    return [t.date, t.desc, t.cat, t.cents, t.type === 'receita' ? 'r' : 'd', t.recKey ?? 0];
+    return [t.id, t.date, t.desc, t.cat, t.cents, t.type === 'receita' ? 'r' : 'd', t.recKey ?? 0];
 }
 
 function unpackTx(p: unknown, i: number): Tx | null {
+    if (Array.isArray(p) && p.length >= 7) {
+        return { id: String(p[0]), date: p[1], desc: p[2], cat: p[3], cents: p[4], type: p[5] === 'r' ? 'receita' : 'despesa', recKey: p[6] ? p[6] : undefined };
+    }
     if (Array.isArray(p)) {
+        // formato antigo sem id: usa o id posicional
         return { id: 't' + i, date: p[0], desc: p[1], cat: p[2], cents: p[3], type: p[4] === 'r' ? 'receita' : 'despesa', recKey: p[5] ? p[5] : undefined };
     }
     if (p && typeof p === 'object' && 'id' in p) return p as Tx;
@@ -168,7 +172,7 @@ function salvageRows(joined: string): Tx[] {
     }).sort((a, b) => b.date.localeCompare(a.date));
 }
 
-// Oito chaves fixas, cada uma dentro do limite por valor.
+// Fatias fixas de texto no localStorage (cada uma bem abaixo do limite do navegador).
 function useChunkedTxs(): [Tx[], (v: Tx[]) => boolean, { ready: boolean; message: string; failed: boolean; salvage: boolean }] {
     const h0 = useLocalState('mf.txs.0', '');
     const h1 = useLocalState('mf.txs.1', '');
@@ -178,7 +182,31 @@ function useChunkedTxs(): [Tx[], (v: Tx[]) => boolean, { ready: boolean; message
     const h5 = useLocalState('mf.txs.5', '');
     const h6 = useLocalState('mf.txs.6', '');
     const h7 = useLocalState('mf.txs.7', '');
-    const hooks = [h0, h1, h2, h3, h4, h5, h6, h7];
+    const h8 = useLocalState('mf.txs.8', '');
+    const h9 = useLocalState('mf.txs.9', '');
+    const h10 = useLocalState('mf.txs.10', '');
+    const h11 = useLocalState('mf.txs.11', '');
+    const h12 = useLocalState('mf.txs.12', '');
+    const h13 = useLocalState('mf.txs.13', '');
+    const h14 = useLocalState('mf.txs.14', '');
+    const h15 = useLocalState('mf.txs.15', '');
+    const h16 = useLocalState('mf.txs.16', '');
+    const h17 = useLocalState('mf.txs.17', '');
+    const h18 = useLocalState('mf.txs.18', '');
+    const h19 = useLocalState('mf.txs.19', '');
+    const h20 = useLocalState('mf.txs.20', '');
+    const h21 = useLocalState('mf.txs.21', '');
+    const h22 = useLocalState('mf.txs.22', '');
+    const h23 = useLocalState('mf.txs.23', '');
+    const h24 = useLocalState('mf.txs.24', '');
+    const h25 = useLocalState('mf.txs.25', '');
+    const h26 = useLocalState('mf.txs.26', '');
+    const h27 = useLocalState('mf.txs.27', '');
+    const h28 = useLocalState('mf.txs.28', '');
+    const h29 = useLocalState('mf.txs.29', '');
+    const h30 = useLocalState('mf.txs.30', '');
+    const h31 = useLocalState('mf.txs.31', '');
+    const hooks = [h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18, h19, h20, h21, h22, h23, h24, h25, h26, h27, h28, h29, h30, h31];
     const ready = hooks.every(h => h[2] && h[2].ready);
     const message = Array.from(new Set(hooks.map(h => (h[2] && h[2].message) || '').filter(Boolean))).join(' ');
     const failed = hooks.some(h => { const st = (h[2] as unknown as { status?: string }).status; return st === 'quota' || st === 'invalid'; });
@@ -199,10 +227,6 @@ function useChunkedTxs(): [Tx[], (v: Tx[]) => boolean, { ready: boolean; message
         const s = JSON.stringify(v.map(packTx));
         if (s.length > CHUNKS * CHUNK_CAP) return false;
         const parts = packChunks(s);
-        // Pré-checagem: o viewer rejeita valores cujo JSON escapado passa de 16 KiB.
-        for (const p of parts) {
-            if (new TextEncoder().encode(JSON.stringify(p)).length > 16384 - 32) return false;
-        }
         let ok = true;
         // Grava do fim para o começo: libera as fatias antigas grandes antes de escrever as novas, sem estourar a cota total no meio do caminho.
         for (let i = CHUNKS - 1; i >= 0; i--) { if (!hooks[i][1](parts[i])) ok = false; }
@@ -505,9 +529,9 @@ function StorageMeter({ txs, cats, recs }: { txs: Tx[]; cats: Category[]; recs: 
             + 2048; // marcadores de meses e tema
         return bytes / 1024;
     }, [txs, cats, recs]);
-    const pct = Math.min(100, Math.round((kb / 64) * 100));
+    const pct = Math.min(100, Math.round((kb / 1600) * 100));
     return <div style={{ marginTop: 14, fontSize: 12, color: 'var(--ink2)', textAlign: 'center' }}>
-        Armazenamento: ~{kb.toFixed(0)} KB de 64 KB ({pct}%)
+        Armazenamento: ~{kb.toFixed(0)} KB de 1600 KB ({pct}%)
     </div>;
 }
 export function App() {
