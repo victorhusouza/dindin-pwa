@@ -1,6 +1,6 @@
 # Minhas Finanças
 
-App pessoal de finanças: registra despesas e receitas por categoria, acompanha contas fixas do mês e mostra o resumo (saldo, gastos por categoria e últimos 6 meses). Feito em React + TypeScript + Vite, sem backend: todos os dados ficam no navegador (localStorage) de cada aparelho.
+App pessoal de finanças: registra despesas e receitas por categoria, acompanha contas fixas do mês e mostra o resumo (saldo, gastos por categoria e últimos 6 meses). Feito em React + TypeScript + Vite. Funciona sozinho no navegador (localStorage) ou com o servidor próprio opcional (pasta `api/`), que adiciona login, sincronização entre aparelhos e histórico de alterações.
 
 ## Rodar na sua máquina
 
@@ -66,11 +66,21 @@ O app vem com um conjunto básico de categorias de despesa e receita (`DEFAULT_C
 - Sincronização entre aparelhos (ex.: Supabase/Firebase)
 - Publicar como app instalável (o manifest já permite "Adicionar à tela de início")
 
+## Servidor próprio (opcional): login, sincronização e histórico
+
+A pasta `api/` traz uma API em Node.js + SQLite que adiciona:
+
+- login com usuário e senha (senha só em hash scrypt, bloqueio após 5 tentativas erradas);
+- sincronização offline-first entre aparelhos (o servidor é a fonte da verdade; em conflito, a última edição vence; excluir é reversível);
+- histórico de cada alteração (o que mudou, de qual aparelho e quando).
+
+Para rodar local: `cd api && npm install && npm run build && npm start` (a API sobe em `http://127.0.0.1:3100`; o `npm run dev` do app já faz proxy de `/api`). Para produção, veja os exemplos em `deploy/` (Caddy + systemd) e o modelo de segurança em `docs/seguranca.md`.
+
 ---
 
 # Minhas Finanças (English)
 
-A personal finance app: track expenses and income by category, manage recurring monthly bills, and see a summary (balance, spending by category, last 6 months). Built with React + TypeScript + Vite, no backend: all data stays in the browser's localStorage on each device.
+A personal finance app: track expenses and income by category, manage recurring monthly bills, and see a summary (balance, spending by category, last 6 months). Built with React + TypeScript + Vite. It works standalone in the browser (localStorage) or with the optional self-hosted server (`api/`), which adds login, cross-device sync and change history.
 
 ## Run locally
 
@@ -86,6 +96,16 @@ Opens at `http://localhost:5173`. Build with `npm run build` (outputs `dist/`, r
 ## Data
 
 Everything lives in localStorage under `mf.*` keys. No sync between devices. The app includes JSON backup export/import and statement import (OFX/CSV/XLSX) from the ⋯ menu. It ships with a basic set of categories and no preset bills — each user adds their own.
+
+## Optional self-hosted server: login, sync and history
+
+The `api/` folder holds a Node.js + SQLite API that adds:
+
+- username + password login (scrypt hashes only, lockout after 5 failed attempts);
+- offline-first sync across devices (server is the source of truth; last edit wins; deletes are soft/recoverable);
+- per-change history (what changed, from which device, when).
+
+Run locally: `cd api && npm install && npm run build && npm start` (listens on `http://127.0.0.1:3100`; the app's `npm run dev` already proxies `/api`). For production see `deploy/` examples (Caddy + systemd) and the security model in `docs/seguranca.md` (PT-BR).
 
 ## License
 

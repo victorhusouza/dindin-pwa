@@ -1,0 +1,26 @@
+# Exemplo de serviço systemd para a API do Minhas Finanças.
+# Ajuste usuário, caminhos e porta. Rode como usuário dedicado SEM privilégios.
+
+[Unit]
+Description=Minhas Finanças - API (login, sync, historico)
+After=network.target
+
+[Service]
+Type=simple
+User=usuario-do-app
+Group=usuario-do-app
+WorkingDirectory=/srv/app-exemplo/api
+Environment=PORT=3100
+Environment=HOST=127.0.0.1
+Environment=DATA_DIR=/srv/app-exemplo/data
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/app-exemplo/data
+
+[Install]
+WantedBy=multi-user.target

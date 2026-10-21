@@ -1,0 +1,18 @@
+# Exemplo de Caddyfile para o Minhas Finanças com o servidor de sync.
+# Substitua o domínio e os caminhos pelos seus. O Caddy cuida do HTTPS sozinho.
+
+app.exemplo.com {
+    encode zstd gzip
+
+    # API (Node escutando só em localhost)
+    handle /api/* {
+        reverse_proxy 127.0.0.1:3100
+    }
+
+    # App estático (build do Vite) com fallback de SPA
+    handle {
+        root * /var/www/app-exemplo
+        try_files {path} /index.html
+        file_server
+    }
+}
