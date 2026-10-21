@@ -42,6 +42,22 @@ aparece neste repositório.
 - Validade deslizante de 7 dias (renova a cada uso) com teto absoluto de 30 dias.
 - Logout apaga a sessão no servidor.
 
+## Tokens de serviço (acesso de IAs e assistentes)
+
+A pessoa usuária pode conectar a própria IA/assistente ao app com permissões
+limitadas, sem entregar a senha:
+
+- Token próprio (`dindin_svc_...`) enviado no header `Authorization: Bearer`;
+  o banco guarda apenas o SHA-256, e o token completo aparece uma única vez,
+  na criação (`api/scripts/service-token.mjs`).
+- Escopos por permissão: `read` (ler dados), `tx:create` (lançar),
+  `tx:edit` (editar), `tx:delete` (apagar). Operação fora do escopo recebe 403.
+- Validade opcional (sem prazo por padrão); revogação imediata apagando o
+  token (`service-token.mjs revoke`).
+- O nome do token (ex.: "Instinct WhatsApp") aparece como aparelho no
+  histórico de cada alteração feita por ele.
+- A sessão de login (usuário + senha) continua sendo a única com acesso total.
+
 ## Dados e sincronização
 
 - Cada registro (lançamento, categoria, conta fixa, regra de categorização) é

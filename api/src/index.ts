@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, created_at INT
 CREATE TABLE IF NOT EXISTS records (entity TEXT NOT NULL, id TEXT NOT NULL, updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL, PRIMARY KEY (entity, id));
 CREATE TABLE IF NOT EXISTS history (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '', entity TEXT NOT NULL, rid TEXT NOT NULL, op TEXT NOT NULL, before TEXT, after TEXT);
 CREATE TABLE IF NOT EXISTS fails (k TEXT PRIMARY KEY, n INTEGER NOT NULL, locked_until INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS service_tokens (token_hash TEXT PRIMARY KEY, label TEXT NOT NULL, scopes TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER);
 `);
 
 // ---------- senha (scrypt) ----------
@@ -87,6 +88,30 @@ function sessionFromCookie(req: http.IncomingMessage): { token: string; device: 
 }
 function cookieHeader(token: string, maxAgeSec: number): string {
     return `dindin_s=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}`;
+}
+
+// ---------- tokens de servico (acesso de IAs/assistentes como feature) ----------
+// Bearer no header Authorization. Escopos por permissao (ex.: tx:create),
+// validade opcional (expires_at NULL = sem prazo), revogavel apagando a linha.
+// O nome do token vira o "device" no historico de alteracoes.
+// Escopos previstos: read | tx:create | tx:edit | tx:delete (sessao de login pode tudo).
+interface Auth { kind: 'session' | 'service'; device: string; scopes?: Set<string> }
+function serviceFromHeader(req: http.IncomingMessage): Auth | null {
+    const m = /^Bearer (dindin_svc_[A-Za-z0-9_-]{20,80})$/.exec(String(req.headers.authorization || ''));
+    if (!m) return null;
+    const row = db.prepare('SELECT label, scopes, expires_at FROM service_tokens WHERE token_hash = ?').get(sha256(m[1])) as any;
+    if (!row) return null;
+    if (row.expires_at && Date.now() > row.expires_at) return null; // vencido: trata como inexistente
+    return { kind: 'service', device: row.label, scopes: new Set(String(row.scopes).split(',')) };
+}
+function validNewTx(data: any): boolean {
+    return data && typeof data === 'object' && !Array.isArray(data)
+        && typeof data.id === 'string' && !!data.id
+        && /^\d{4}-\d{2}-\d{2}$/.test(String(data.date))
+        && typeof data.desc === 'string' && !!data.desc.trim()
+        && typeof data.cat === 'string' && !!data.cat
+        && Number.isInteger(data.cents) && data.cents > 0
+        && (data.type === 'despesa' || data.type === 'receita');
 }
 
 // ---------- bloqueio por tentativas ----------
@@ -225,9 +250,15 @@ const server = http.createServer(async (req, res) => {
             return send(res, 200, { ok: true }, { 'set-cookie': cookieHeader('x', 0) });
         }
 
-        // daqui para baixo: so autenticado
-        if (!sess) return send(res, 401, { error: 'Entre com a sua senha.' });
+        // daqui para baixo: so autenticado (sessao de login OU token de servico)
+        const auth: Auth | null = sess ? { kind: 'session', device: sess.device } : serviceFromHeader(req);
+        if (!auth) return send(res, 401, { error: 'Entre com a sua senha.' });
         if (!hasUser()) return send(res, 409, { error: 'Setup pendente.' });
+        if (auth.kind === 'service') {
+            const can = (sc: string) => auth.scopes!.has(sc);
+            const allowed = (p === '/api/sync') || (p === '/api/state' && can('read'));
+            if (!allowed) return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
+        }
 
         if (req.method === 'GET' && p === '/api/state') {
             const out: Record<string, any[]> = {};
@@ -239,8 +270,32 @@ const server = http.createServer(async (req, res) => {
 
         if (req.method === 'POST' && p === '/api/sync') {
             const body = await readBody(req);
+            if (auth.kind === 'service') {
+                // escopos: tx:create (novo), tx:edit (alterar existente), tx:delete. Lote pequeno, tudo ou nada.
+                const can = (sc: string) => auth.scopes!.has(sc);
+                const ops = Array.isArray(body.ops) ? body.ops.slice(0, 50) : [];
+                if (!ops.length) return send(res, 400, { error: 'Nada para lançar.' });
+                const exists = db.prepare('SELECT deleted FROM records WHERE entity = ? AND id = ?');
+                for (const o of ops) {
+                    if (o?.entity !== 'tx') return send(res, 403, { error: 'Este acesso só lança despesas e receitas.' });
+                    const cur = exists.get('tx', String(o?.id || '')) as any;
+                    if (o.op === 'delete') {
+                        if (!can('tx:delete')) return send(res, 403, { error: 'Este acesso não pode apagar lançamentos.' });
+                    } else if (o.op === 'upsert') {
+                        if (!validNewTx(o.data)) return send(res, 400, { error: 'Lançamento incompleto (data, descrição, categoria, valor).' });
+                        if (o.data.id !== o.id) return send(res, 400, { error: 'Id do lançamento não confere.' });
+                        if (cur && !cur.deleted && !can('tx:edit')) return send(res, 403, { error: 'Este acesso não pode editar lançamentos.' });
+                        if (!cur && !can('tx:create')) return send(res, 403, { error: 'Este acesso não pode criar lançamentos.' });
+                        if (cur && cur.deleted && !can('tx:create')) return send(res, 403, { error: 'Este acesso não pode criar lançamentos.' });
+                    } else {
+                        return send(res, 400, { error: 'Operação inválida.' });
+                    }
+                }
+                const r = applyOps(auth.device, ops);
+                return send(res, 200, { serverTime: Date.now(), applied: r.applied, results: r.results });
+            }
             const ops = Array.isArray(body.ops) ? body.ops.slice(0, 2000) : [];
-            const device = String(body.device || sess.device || '').slice(0, 80);
+            const device = String(body.device || auth.device || '').slice(0, 80);
             const r = applyOps(device, ops);
             return send(res, 200, { serverTime: Date.now(), applied: r.applied, results: r.results });
         }
