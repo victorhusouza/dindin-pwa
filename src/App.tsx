@@ -519,19 +519,23 @@ function Overlay({ onClose, children }: { onClose?: () => void; children: React.
 }
 
 function StorageMeter({ txs, cats, recs }: { txs: Tx[]; cats: Category[]; recs: Rec[] }) {
+    // Mede a COPIA OFFLINE no aparelho (localStorage do navegador). A fonte da
+    // verdade e o banco na VM; isto e so o cache local para o app abrir offline.
     const kb = useMemo(() => {
-        const enc = new TextEncoder();
-        const txJson = JSON.stringify(txs.map(packTx));
-        // O viewer guarda os valores escapados (~+20%) e cobra 64 KiB no total.
-        const bytes = enc.encode(txJson).length * 1.2
-            + enc.encode(JSON.stringify(cats)).length * 1.2
-            + enc.encode(JSON.stringify(recs)).length * 1.2
-            + 2048; // marcadores de meses e tema
-        return bytes / 1024;
+        void txs; void cats; void recs; // recalcula quando os dados mudam
+        try {
+            let bytes = 0;
+            for (let i = 0; i < window.localStorage.length; i++) {
+                const k = window.localStorage.key(i)!;
+                bytes += k.length + (window.localStorage.getItem(k)?.length || 0);
+            }
+            return bytes / 1024;
+        } catch { return 0; }
     }, [txs, cats, recs]);
     const pct = Math.min(100, Math.round((kb / 1600) * 100));
     return <div style={{ marginTop: 14, fontSize: 12, color: 'var(--ink2)', textAlign: 'center' }}>
-        Armazenamento: ~{kb.toFixed(0)} KB de 1600 KB ({pct}%)
+        Cópia offline neste aparelho: ~{kb.toFixed(0)} KB de ~1600 KB ({pct}%)<br />
+        Seus dados completos ficam na sua VM.
     </div>;
 }
 export function App() {
