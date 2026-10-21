@@ -218,3 +218,16 @@ html, body, #root { margin: 0; min-height: 100%; }
 .checkrow { display: flex; align-items: center; gap: 10px; padding: 12px 0 2px; font-size: 14px; cursor: pointer; }
 .checkrow input { width: 22px; height: 22px; accent-color: var(--teal); flex-shrink: 0; }
 .sheetbtn.primary:disabled { opacity: .5; }
+
+/* Acessos de IA */
+.aitoken { border: 1px solid var(--hairline); border-radius: 12px; padding: 12px 12px 4px; margin-top: 12px; }
+.aitoken-name { font-weight: 700; font-size: 15px; }
+.aitoken-scopes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.aitoken-scope { font-size: 12px; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--hairline); color: var(--ink2); }
+.aitoken-scope.danger { border-color: var(--desp); color: var(--desp); }
+.aitoken-meta { color: var(--ink2); font-size: 13px; margin-top: 8px; }
+.tokencode { height: auto; border-color: var(--teal); color: var(--ink); }
+.field select {
+    width: 100%; box-sizing: border-box; padding: 12px; border-radius: 12px; font-size: 16px;
+    border: 1px solid var(--hairline); background: var(--surface); color: var(--ink); font-family: inherit;
+}

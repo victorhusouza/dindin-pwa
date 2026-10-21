@@ -15,24 +15,24 @@ function entryName(e: HistoryEntry): string {
     return r.desc || r.label || r.key || e.rid;
 }
 
-function HistoryModal({ onClose }: { onClose: () => void }) {
+export function HistoryModal({ onClose, device }: { onClose: () => void; device?: string }) {
     const [entries, setEntries] = useState<HistoryEntry[] | null>(null);
     const [err, setErr] = useState('');
     useEffect(() => {
-        fetch('/api/history?limit=100', { credentials: 'same-origin' })
+        fetch('/api/history?limit=100' + (device ? '&device=' + encodeURIComponent(device) : ''), { credentials: 'same-origin' })
             .then(r => { if (!r.ok) throw new Error(); return r.json(); })
             .then(b => setEntries(b.entries || []))
             .catch(() => setErr('Não consegui carregar o histórico agora.'));
-    }, []);
+    }, [device]);
     return <div style={overlayStyle} onClick={onClose}>
         <div style={modalStyle} onClick={e => e.stopPropagation()}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-                <strong>Histórico de alterações</strong>
+                <strong>{device ? 'Histórico: ' + device : 'Histórico de alterações'}</strong>
                 <button onClick={onClose} style={xStyle}>✕</button>
             </div>
             {err && <p style={{ color: '#f87171' }}>{err}</p>}
             {!entries && !err && <p>Carregando…</p>}
-            {entries && entries.length === 0 && <p>Nenhuma alteração ainda.</p>}
+            {entries && entries.length === 0 && <p>{device ? 'Nada registrado por esse acesso ainda.' : 'Nenhuma alteração ainda.'}</p>}
             {entries && entries.map(e => <div key={e.seq} style={{ padding: '8px 0', borderBottom: '1px solid #334155', fontSize: 14 }}>
                 <div>{ENTITY_LABEL[e.entity] || e.entity} {OP_LABEL[e.op] || e.op}: <strong>{entryName(e)}</strong></div>
                 <div style={{ color: '#94a3b8', fontSize: 12 }}>{new Date(e.ts).toLocaleString('pt-BR')} · {e.device || 'aparelho'}</div>

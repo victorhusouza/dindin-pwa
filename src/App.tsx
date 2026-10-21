@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocalState } from './localState';
 import { decryptBackupJson, encryptBackupJson, isEncryptedBackup } from './crypto';
+import { HistoryModal } from './gate';
 import './style.css';
 import heroImg from './photos/hero.png';
 
@@ -518,6 +519,136 @@ function Overlay({ onClose, children }: { onClose?: () => void; children: React.
     return <div className="overlay" style={style} onClick={onClose}>{children}</div>;
 }
 
+
+// ---------- Acessos de IA (tokens com permissões) ----------
+interface AIToken { label: string; scopes: string[]; created_at: number; expires_at: number | null; last_used_at: number | null }
+const SCOPE_LABEL: Record<string, string> = {
+    read: 'Ler os dados',
+    'tx:create': 'Lançar despesas e receitas',
+    'tx:edit': 'Editar lançamentos',
+    'tx:delete': 'Apagar lançamentos',
+};
+const SCOPE_ORDER = ['read', 'tx:create', 'tx:edit', 'tx:delete'];
+const fmtDay = (ts: number) => new Date(ts).toLocaleDateString('pt-BR');
+
+function AIAccessSheet({ onClose }: { onClose: () => void }) {
+    const [tokens, setTokens] = useState<AIToken[] | null>(null);
+    const [err, setErr] = useState('');
+    const [view, setView] = useState<'list' | 'create' | 'created'>('list');
+    const [label, setLabel] = useState('');
+    const [picked, setPicked] = useState<string[]>(['read']);
+    const [expiresDays, setExpiresDays] = useState('90');
+    const [busy, setBusy] = useState(false);
+    const [created, setCreated] = useState<{ token: string; label: string } | null>(null);
+    const [copied, setCopied] = useState(false);
+    const [confirmRevoke, setConfirmRevoke] = useState('');
+    const [historyFor, setHistoryFor] = useState('');
+
+    const load = () => {
+        fetch('/api/service-tokens', { credentials: 'same-origin' })
+            .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+            .then(b => setTokens(b.tokens || []))
+            .catch(() => setErr('Não consegui carregar os acessos agora.'));
+    };
+    useEffect(load, []);
+
+    const toggle = (sc: string) => setPicked(p => p.includes(sc) ? p.filter(x => x !== sc) : [...p, sc]);
+
+    const create = async () => {
+        setBusy(true); setErr('');
+        try {
+            const r = await fetch('/api/service-tokens', {
+                method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ label: label.trim(), scopes: picked, expiresDays: Number(expiresDays) }),
+            });
+            const b = await r.json().catch(() => ({}));
+            if (!r.ok) { setErr(b.error || 'Não deu certo. Tente de novo.'); return; }
+            setCreated({ token: b.token, label: b.label }); setView('created'); setCopied(false);
+        } catch { setErr('Sem conexão com o servidor.'); }
+        finally { setBusy(false); }
+    };
+
+    const copy = async () => {
+        try { await navigator.clipboard.writeText(created!.token); setCopied(true); }
+        catch { /* o campo é selecionável: dá para copiar na mão */ }
+    };
+
+    const revoke = async (name: string) => {
+        setBusy(true); setErr('');
+        try {
+            const r = await fetch('/api/service-tokens/revoke', {
+                method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ label: name }),
+            });
+            const b = await r.json().catch(() => ({}));
+            if (!r.ok) { setErr(b.error || 'Não deu certo. Tente de novo.'); return; }
+            setConfirmRevoke(''); load();
+        } catch { setErr('Sem conexão com o servidor.'); }
+        finally { setBusy(false); }
+    };
+
+    const resetForm = () => { setLabel(''); setPicked(['read']); setExpiresDays('90'); setCreated(null); };
+
+    return <>
+        <div className="sheethead"><h2>Acessos de IA</h2><button className="sheetx" aria-label="Fechar" onClick={onClose}>✕</button></div>
+
+        {view === 'list' && <>
+            <p className="hint">Cada acesso é um código para uma IA (como o Instinct) mexer no app só com as permissões que você der.</p>
+            {err && <p className="error">{err}</p>}
+            {tokens === null && !err && <p className="hint">Carregando…</p>}
+            {tokens && tokens.length === 0 && <p className="hint">Nenhum acesso criado ainda.</p>}
+            {tokens && tokens.map(t => <div key={t.label} className="aitoken">
+                <div className="aitoken-name">{t.label}</div>
+                <div className="aitoken-scopes">{SCOPE_ORDER.filter(sc => t.scopes.includes(sc)).map(sc =>
+                    <span key={sc} className={'aitoken-scope' + (sc === 'tx:delete' ? ' danger' : '')}>{SCOPE_LABEL[sc]}</span>)}</div>
+                <div className="aitoken-meta">
+                    Criado em {fmtDay(t.created_at)} · {t.expires_at ? 'vence em ' + fmtDay(t.expires_at) : 'sem validade'} · {t.last_used_at ? 'último uso ' + fmtDay(t.last_used_at) : 'nunca usado'}
+                </div>
+                <button className="sheetbtn" onClick={() => setHistoryFor(t.label)}>🕘 Ver o que ela fez</button>
+                {confirmRevoke === t.label
+                    ? <button className="sheetbtn danger" disabled={busy} onClick={() => void revoke(t.label)}>Confirmar: ela perde o acesso na hora</button>
+                    : <button className="sheetbtn" disabled={busy} onClick={() => setConfirmRevoke(t.label)}>Revogar acesso</button>}
+            </div>)}
+            <button className="sheetbtn primary" onClick={() => { setErr(''); setView('create'); }}>+ Novo acesso</button>
+            <button className="sheetbtn ghost" onClick={onClose}>Fechar</button>
+        </>}
+
+        {view === 'create' && <>
+            <label className="field"><span>Nome do acesso</span>
+                <input value={label} onChange={e => setLabel(e.target.value)} placeholder="Ex.: Instinct WhatsApp" maxLength={40} autoFocus />
+            </label>
+            <p className="hint">O que essa IA pode fazer?</p>
+            {SCOPE_ORDER.map(sc => <label className="checkrow" key={sc}>
+                <input type="checkbox" checked={picked.includes(sc)} onChange={() => toggle(sc)} />
+                <span style={sc === 'tx:delete' ? { color: 'var(--desp)' } : undefined}>
+                    {SCOPE_LABEL[sc]}{sc === 'tx:delete' ? ' — cuidado: apaga de verdade' : ''}
+                </span>
+            </label>)}
+            <label className="field"><span>Validade do código</span>
+                <select value={expiresDays} onChange={e => setExpiresDays(e.target.value)}>
+                    <option value="90">90 dias (recomendado)</option>
+                    <option value="30">30 dias</option>
+                    <option value="365">1 ano</option>
+                    <option value="0">Sem validade</option>
+                </select>
+            </label>
+            {err && <p className="error">{err}</p>}
+            <button className="sheetbtn primary" disabled={busy || !label.trim() || picked.length === 0} onClick={() => void create()}>Criar acesso</button>
+            <button className="sheetbtn ghost" onClick={() => { setErr(''); setView('list'); }}>Voltar</button>
+        </>}
+
+        {view === 'created' && created && <>
+            <p className="hint">Acesso "{created.label}" criado. Copie o código agora: ele aparece <strong>só desta vez</strong>. Se perder, revogue e crie outro.</p>
+            <textarea className="backuptext tokencode" readOnly value={created.token} onFocus={e => e.target.select()} rows={3} />
+            <button className="sheetbtn primary" onClick={() => void copy()}>{copied ? '✓ Copiado' : '📋 Copiar código'}</button>
+            <p className="hint">Cole na sua IA. No servidor fica só uma versão embaralhada dele.</p>
+            <button className="sheetbtn ghost" onClick={() => { resetForm(); setView('list'); load(); }}>Concluído</button>
+        </>}
+
+        {historyFor && <HistoryModal device={historyFor} onClose={() => setHistoryFor('')} />}
+    </>;
+}
+
 function StorageMeter({ txs, cats, recs }: { txs: Tx[]; cats: Category[]; recs: Rec[] }) {
     // Mede a COPIA OFFLINE no aparelho (localStorage do navegador). A fonte da
     // verdade e o banco na VM; isto e so o cache local para o app abrir offline.
@@ -566,6 +697,7 @@ export function App() {
     const [showForm, setShowForm] = useState(false);
     const [editing, setEditing] = useState<Tx | null>(null);
     const [menuOpen, setMenuOpen] = useState(false);
+    const [showAIAccess, setShowAIAccess] = useState(false);
     const [showCatRules, setShowCatRules] = useState(false);
     const [selCat, setSelCat] = useState<string | null>(null);
     const [showInstall, setShowInstall] = useState(false);
@@ -1175,8 +1307,15 @@ export function App() {
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowExportChoice(true); }}>☁️ Exportar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); restoreInput.current && restoreInput.current.click(); }}>↩️ Restaurar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowInstall(true); }}>📲 Instalar na tela de início</button>
+                    <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowAIAccess(true); }}>🤖 Acessos de IA</button>
                     <StorageMeter txs={txs} cats={cats} recs={recs} />
                     <button className="sheetbtn ghost" onClick={() => setMenuOpen(false)}>Fechar</button>
+                </div>
+            </Overlay>}
+
+            {showAIAccess && <Overlay onClose={() => setShowAIAccess(false)}>
+                <div className="sheet" onClick={e => e.stopPropagation()}>
+                    <AIAccessSheet onClose={() => setShowAIAccess(false)} />
                 </div>
             </Overlay>}
 
