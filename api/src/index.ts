@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, created_at INT
 CREATE TABLE IF NOT EXISTS records (entity TEXT NOT NULL, id TEXT NOT NULL, updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL, PRIMARY KEY (entity, id));
 CREATE TABLE IF NOT EXISTS history (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '', entity TEXT NOT NULL, rid TEXT NOT NULL, op TEXT NOT NULL, before TEXT, after TEXT);
 CREATE TABLE IF NOT EXISTS fails (k TEXT PRIMARY KEY, n INTEGER NOT NULL, locked_until INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS service_tokens (token_hash TEXT PRIMARY KEY, label TEXT NOT NULL, scopes TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER);
+CREATE TABLE IF NOT EXISTS service_tokens (token_hash TEXT PRIMARY KEY, label TEXT NOT NULL, scopes TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER, last_used_at INTEGER);
 `);
 
 // ---------- senha (scrypt) ----------
@@ -96,12 +96,16 @@ function cookieHeader(token: string, maxAgeSec: number): string {
 // O nome do token vira o "device" no historico de alteracoes.
 // Escopos previstos: read | tx:create | tx:edit | tx:delete (sessao de login pode tudo).
 interface Auth { kind: 'session' | 'service'; device: string; scopes?: Set<string> }
+const VALID_SCOPES = new Set(['read', 'tx:create', 'tx:edit', 'tx:delete']);
+const touchLastUsed = db.prepare('UPDATE service_tokens SET last_used_at = ? WHERE token_hash = ? AND (last_used_at IS NULL OR last_used_at < ?)');
 function serviceFromHeader(req: http.IncomingMessage): Auth | null {
     const m = /^Bearer (dindin_svc_[A-Za-z0-9_-]{20,80})$/.exec(String(req.headers.authorization || ''));
     if (!m) return null;
-    const row = db.prepare('SELECT label, scopes, expires_at FROM service_tokens WHERE token_hash = ?').get(sha256(m[1])) as any;
+    const hash = sha256(m[1]);
+    const row = db.prepare('SELECT label, scopes, expires_at FROM service_tokens WHERE token_hash = ?').get(hash) as any;
     if (!row) return null;
     if (row.expires_at && Date.now() > row.expires_at) return null; // vencido: trata como inexistente
+    touchLastUsed.run(Date.now(), hash, Date.now() - 60000);
     return { kind: 'service', device: row.label, scopes: new Set(String(row.scopes).split(',')) };
 }
 function validNewTx(data: any): boolean {
@@ -300,9 +304,44 @@ const server = http.createServer(async (req, res) => {
             return send(res, 200, { serverTime: Date.now(), applied: r.applied, results: r.results });
         }
 
+        if (req.method === 'GET' && p === '/api/service-tokens') {
+            if (auth.kind !== 'session') return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
+            const rows = db.prepare('SELECT label, scopes, created_at, expires_at, last_used_at FROM service_tokens ORDER BY created_at DESC').all() as any[];
+            return send(res, 200, {
+                tokens: rows.map(r => ({ label: r.label, scopes: String(r.scopes).split(','), created_at: r.created_at, expires_at: r.expires_at, last_used_at: r.last_used_at })),
+            });
+        }
+
+        if (req.method === 'POST' && p === '/api/service-tokens') {
+            if (auth.kind !== 'session') return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
+            const body = await readBody(req);
+            const label = String(body.label || '').trim().slice(0, 80);
+            const scopes: string[] = Array.isArray(body.scopes) ? body.scopes.map(String) : [];
+            if (!label) return send(res, 400, { error: 'Dê um nome para o acesso (ex.: Instinct WhatsApp).' });
+            if (!scopes.length || scopes.some(sc => !VALID_SCOPES.has(sc))) return send(res, 400, { error: 'Permissões inválidas.' });
+            const dup = db.prepare('SELECT 1 AS x FROM service_tokens WHERE label = ?').get(label);
+            if (dup) return send(res, 409, { error: 'Já existe um acesso com esse nome. Revogue-o antes de criar outro.' });
+            const days = Number(body.expiresDays) || 0; // 0/ausente = sem validade
+            const token = 'dindin_svc_' + crypto.randomBytes(32).toString('base64url');
+            db.prepare('INSERT INTO service_tokens (token_hash, label, scopes, created_at, expires_at, last_used_at) VALUES (?,?,?,?,?,NULL)')
+                .run(sha256(token), label, scopes.join(','), Date.now(), days > 0 ? Date.now() + days * 86400000 : null);
+            return send(res, 200, { ok: true, token, label, scopes, expires_at: days > 0 ? Date.now() + days * 86400000 : null });
+        }
+
+        if (req.method === 'POST' && p === '/api/service-tokens/revoke') {
+            if (auth.kind !== 'session') return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
+            const body = await readBody(req);
+            const label = String(body.label || '').slice(0, 80);
+            const n = db.prepare('DELETE FROM service_tokens WHERE label = ?').run(label).changes;
+            return send(res, n ? 200 : 404, { ok: !!n, error: n ? undefined : 'Acesso não encontrado.' });
+        }
+
         if (req.method === 'GET' && p === '/api/history') {
             const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 50, 1), 200);
-            const rows = db.prepare('SELECT seq, ts, device, entity, rid, op, before, after FROM history ORDER BY seq DESC LIMIT ?').all(limit) as any[];
+            const device = String(url.searchParams.get('device') || '').slice(0, 80);
+            const rows = (device
+                ? db.prepare('SELECT seq, ts, device, entity, rid, op, before, after FROM history WHERE device = ? ORDER BY seq DESC LIMIT ?').all(device, limit)
+                : db.prepare('SELECT seq, ts, device, entity, rid, op, before, after FROM history ORDER BY seq DESC LIMIT ?').all(limit)) as any[];
             return send(res, 200, {
                 entries: rows.map(r => ({ ...r, before: r.before ? JSON.parse(r.before) : null, after: r.after ? JSON.parse(r.after) : null })),
             });
