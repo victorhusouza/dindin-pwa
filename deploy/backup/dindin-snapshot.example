@@ -1,0 +1,7 @@
+#!/bin/sh
+# Snapshot diario do banco (roda como o usuario do app, ex.: dindinapp, via cron).
+# Guarda copias locais dos ultimos 30 dias; o envio cifrado fica no dindin-backup-upload.
+set -e
+D=/srv/dindin/backups
+sqlite3 /srv/dindin/data/dindin.db ".backup '$D/dindin-$(date +%F).db'"
+ls -1t $D/dindin-*.db | tail -n +31 | xargs -r rm --

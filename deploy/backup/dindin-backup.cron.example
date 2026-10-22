@@ -1,0 +1,4 @@
+# /etc/cron.d/dindin-backup — agendamento diario do backup (ajuste o usuario).
+# 04:17 snapshot local; 04:27 cifra com a sua chave publica GPG e envia as duas nuvens.
+17 4 * * * dindinapp /usr/local/bin/dindin-snapshot
+27 4 * * * dindinapp /usr/local/bin/dindin-backup-upload >> /srv/dindin/backups/upload.log 2>&1
