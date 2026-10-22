@@ -15,6 +15,8 @@ const SESSION_MAX_MS = 30 * 24 * 3600 * 1000;      // teto absoluto: 30 dias
 const LOCK_FAILS = 5;                              // tentativas antes do bloqueio
 const LOCK_MS = 15 * 60 * 1000;                    // bloqueio de 15 minutos
 const MAX_BODY = 1024 * 1024;                      // 1 MB por requisicao
+const APP_URL = process.env.APP_URL || ''; // URL publica do app (obrigatoria pra montar o link do convite)
+const INVITE_TTL_MS = 3 * 24 * 3600 * 1000;           // convite vale 3 dias
 const ENTITIES = new Set(['tx', 'cat', 'rec', 'catrule', 'pref']);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -302,6 +304,35 @@ const server = http.createServer(async (req, res) => {
             return send(res, 200, { ok: true }, { 'set-cookie': cookieHeader('x', 0) });
         }
 
+        if (req.method === 'POST' && p === '/api/auth/register') {
+            // entrada por convite: uso unico, 3 dias, o convidado escolhe a propria senha.
+            const body = await readBody(req);
+            const hash = sha256(String(body.invite || ''));
+            const user = normUser(body.username);
+            const uIssue = usernameIssues(user);
+            if (uIssue) return send(res, 400, { error: uIssue });
+            const issue = passwordIssues(body.password);
+            if (issue) return send(res, 400, { error: issue });
+            if (body.password !== body.confirm) return send(res, 400, { error: 'As duas senhas não conferem.' });
+            // atomico: conferir o convite, depois o nome, criar a conta e marcar como usado numa transacao so
+            // (convite ANTES do nome: sem convite valido, a resposta e sempre a mesma — nao da pra sondar quais usuarios existem)
+            const reg = db.transaction(() => {
+                const inv = db.prepare('SELECT expires_at, used_at FROM invites WHERE token_hash = ?').get(hash) as any;
+                if (!inv || inv.used_at || Date.now() > inv.expires_at) return 'invite';
+                if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(user)) return 'taken';
+                const r = db.prepare('INSERT INTO users (username, pass_hash, created_at, is_admin, active) VALUES (?,?,?,0,1)')
+                    .run(user, hashPassword(body.password), Date.now());
+                db.prepare('UPDATE invites SET used_at = ? WHERE token_hash = ?').run(Date.now(), hash);
+                return Number(r.lastInsertRowid);
+            });
+            const newId = reg();
+            if (newId === 'invite') return send(res, 401, { error: 'Convite inválido ou vencido.' }); // generico: nao distingue inexistente/usado/vencido
+            if (newId === 'taken') return send(res, 409, { error: 'Esse nome de usuário já está em uso.' });
+            const device = String(body.device || '').slice(0, 80);
+            const s = createSession(device, newId);
+            return send(res, 200, { ok: true }, { 'set-cookie': cookieHeader(s.token, SESSION_TTL_MS / 1000) });
+        }
+
         // daqui para baixo: so autenticado (sessao de login OU token de servico)
         const auth: Auth | null = sess ? { kind: 'session', device: sess.device, userId: sess.userId } : serviceFromHeader(req);
         if (!auth) return send(res, 401, { error: 'Entre com a sua senha.' });
@@ -310,6 +341,56 @@ const server = http.createServer(async (req, res) => {
             const can = (sc: string) => auth.scopes!.has(sc);
             const allowed = (p === '/api/sync') || (p === '/api/state' && can('read'));
             if (!allowed) return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
+        }
+
+        // ---------- administrador (so sessao, so admin; nunca toca nos dados dos usuarios) ----------
+        const isAdmin = auth.kind === 'session' && !!db.prepare('SELECT 1 FROM users WHERE id = ? AND is_admin = 1 AND active = 1').get(auth.userId);
+
+        if (req.method === 'GET' && p === '/api/admin/users') {
+            if (!isAdmin) return send(res, 403, { error: 'Só o administrador.' });
+            const rows = db.prepare('SELECT id, username, created_at, is_admin, active FROM users ORDER BY id').all() as any[];
+            return send(res, 200, { users: rows.map(r => ({ id: r.id, username: r.username, created_at: r.created_at, is_admin: !!r.is_admin, active: !!r.active })) });
+        }
+
+        if (req.method === 'POST' && p === '/api/admin/users/active') {
+            if (!isAdmin) return send(res, 403, { error: 'Só o administrador.' });
+            const body = await readBody(req);
+            const targetId = Number(body.userId);
+            const target = db.prepare('SELECT id, is_admin FROM users WHERE id = ?').get(targetId) as any;
+            if (!target) return send(res, 404, { error: 'Usuário não encontrado.' });
+            const active = body.active ? 1 : 0;
+            if (!active && target.id === auth.userId) return send(res, 400, { error: 'Você não pode desativar a própria conta.' });
+            if (!active && target.is_admin) {
+                const admins = (db.prepare('SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND active = 1').get() as any).n;
+                if (admins <= 1) return send(res, 400, { error: 'É o único administrador ativo.' });
+            }
+            db.prepare('UPDATE users SET active = ? WHERE id = ?').run(active, target.id);
+            if (!active) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id); // sessoes morrem na hora
+            return send(res, 200, { ok: true, userId: target.id, active: !!active });
+        }
+
+        if (req.method === 'GET' && p === '/api/admin/invites') {
+            if (!isAdmin) return send(res, 403, { error: 'Só o administrador.' });
+            const now = Date.now();
+            const rows = db.prepare('SELECT i.token_hash, i.created_at, i.expires_at, i.used_at, u.username AS by FROM invites i JOIN users u ON u.id = i.created_by ORDER BY i.created_at DESC').all() as any[];
+            return send(res, 200, {
+                invites: rows.map(r => ({
+                    ref: String(r.token_hash).slice(0, 8), created_at: r.created_at, expires_at: r.expires_at, used_at: r.used_at, by: r.by,
+                    status: r.used_at ? 'usado' : (now > r.expires_at ? 'vencido' : 'ativo'),
+                })),
+            });
+        }
+
+        if (req.method === 'POST' && p === '/api/admin/invites') {
+            if (!isAdmin) return send(res, 403, { error: 'Só o administrador.' });
+            const token = crypto.randomBytes(32).toString('base64url');
+            const now = Date.now();
+            db.prepare('INSERT INTO invites (token_hash, created_by, created_at, expires_at, used_at) VALUES (?,?,?,?,NULL)')
+                .run(sha256(token), auth.userId, now, now + INVITE_TTL_MS);
+            // o token vai no fragmento (#): nao chega ao servidor nem fica em log
+            if (!APP_URL) return send(res, 500, { error: 'APP_URL não configurada no servidor.' });
+            // o token vai no fragmento (#): nao chega ao servidor nem fica em log
+            return send(res, 200, { ok: true, token, expires_at: now + INVITE_TTL_MS, link: `${APP_URL}/#convite=${token}` });
         }
 
         if (req.method === 'GET' && p === '/api/state') {
