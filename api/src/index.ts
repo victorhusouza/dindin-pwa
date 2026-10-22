@@ -1,4 +1,5 @@
-// dindin API: login (1 usuario), sync offline-first e historico de alteracoes.
+// dindin API: login multiusuario (convite em fase posterior), sync offline-first e historico.
+// Isolamento: toda rota de dados filtra por owner = usuario da sessao/token (T2).
 // Sem framework: node:http + better-sqlite3. Roda em 127.0.0.1 atras do Caddy.
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -19,15 +20,60 @@ const ENTITIES = new Set(['tx', 'cat', 'rec', 'catrule', 'pref']);
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new Database(path.join(DATA_DIR, 'dindin.db'));
 db.pragma('journal_mode = WAL');
+
+// migracao v2 (multiusuario): uma vez, na subida, se o banco for do formato antigo.
+// Idempotente: banco ja migrado (records tem coluna owner) ou zerado sai ileso.
+function migrateIfNeeded(): void {
+    const hasRecords = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='records'").get();
+    if (!hasRecords) return; // banco novo: o CREATE TABLE abaixo ja nasce no formato v2
+    const cols = db.prepare('PRAGMA table_info(records)').all() as any[];
+    if (cols.some(c => c.name === 'owner')) return; // ja migrado
+    db.pragma('foreign_keys = OFF');
+    db.exec(`
+BEGIN;
+CREATE TABLE users_new (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, pass_hash TEXT NOT NULL, created_at INTEGER NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1);
+INSERT INTO users_new (id, username, pass_hash, created_at, is_admin, active) SELECT id, username, pass_hash, created_at, 1, 1 FROM users;
+DROP TABLE users;
+ALTER TABLE users_new RENAME TO users;
+CREATE TABLE records_new (entity TEXT NOT NULL, id TEXT NOT NULL, owner INTEGER NOT NULL DEFAULT 1 REFERENCES users(id), updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL, PRIMARY KEY (entity, id, owner));
+INSERT INTO records_new SELECT entity, id, 1, updated_at, deleted, data FROM records;
+DROP TABLE records;
+ALTER TABLE records_new RENAME TO records;
+CREATE INDEX idx_records_owner ON records(owner, entity);
+CREATE TABLE history_new (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '', entity TEXT NOT NULL, rid TEXT NOT NULL, op TEXT NOT NULL, before TEXT, after TEXT, owner INTEGER NOT NULL DEFAULT 1 REFERENCES users(id));
+INSERT INTO history_new SELECT seq, ts, device, entity, rid, op, before, after, 1 FROM history;
+DROP TABLE history;
+ALTER TABLE history_new RENAME TO history;
+CREATE TABLE sessions_new (token_hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL DEFAULT 1 REFERENCES users(id));
+INSERT INTO sessions_new SELECT token_hash, created_at, expires_at, device, 1 FROM sessions;
+DROP TABLE sessions;
+ALTER TABLE sessions_new RENAME TO sessions;
+CREATE TABLE service_tokens_new (token_hash TEXT PRIMARY KEY, label TEXT NOT NULL, scopes TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER, last_used_at INTEGER, user_id INTEGER NOT NULL DEFAULT 1 REFERENCES users(id));
+INSERT INTO service_tokens_new SELECT token_hash, label, scopes, created_at, expires_at, last_used_at, 1 FROM service_tokens;
+DROP TABLE service_tokens;
+ALTER TABLE service_tokens_new RENAME TO service_tokens;
+CREATE TABLE IF NOT EXISTS invites (token_hash TEXT PRIMARY KEY, created_by INTEGER NOT NULL REFERENCES users(id), created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);
+PRAGMA foreign_key_check;
+COMMIT;
+`);
+    db.pragma('foreign_keys = ON');
+    db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run('schema_v', '2');
+    console.log('migracao v2 (multiusuario) aplicada');
+}
+migrateIfNeeded();
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
-CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY CHECK (id = 1), username TEXT NOT NULL UNIQUE, pass_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS records (entity TEXT NOT NULL, id TEXT NOT NULL, updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL, PRIMARY KEY (entity, id));
-CREATE TABLE IF NOT EXISTS history (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '', entity TEXT NOT NULL, rid TEXT NOT NULL, op TEXT NOT NULL, before TEXT, after TEXT);
+CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, pass_hash TEXT NOT NULL, created_at INTEGER NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS records (entity TEXT NOT NULL, id TEXT NOT NULL, owner INTEGER NOT NULL REFERENCES users(id), updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL, PRIMARY KEY (entity, id, owner));
+CREATE INDEX IF NOT EXISTS idx_records_owner ON records(owner, entity);
+CREATE TABLE IF NOT EXISTS history (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '', entity TEXT NOT NULL, rid TEXT NOT NULL, op TEXT NOT NULL, before TEXT, after TEXT, owner INTEGER NOT NULL REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS fails (k TEXT PRIMARY KEY, n INTEGER NOT NULL, locked_until INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS service_tokens (token_hash TEXT PRIMARY KEY, label TEXT NOT NULL, scopes TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER, last_used_at INTEGER);
+CREATE TABLE IF NOT EXISTS service_tokens (token_hash TEXT PRIMARY KEY, label TEXT NOT NULL, scopes TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER, last_used_at INTEGER, user_id INTEGER NOT NULL REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS invites (token_hash TEXT PRIMARY KEY, created_by INTEGER NOT NULL REFERENCES users(id), created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);
 `);
+db.pragma('foreign_keys = ON');
 
 // ---------- senha (scrypt) ----------
 function hashPassword(pw: string): string {
@@ -64,27 +110,28 @@ function passwordIssues(pw: unknown): string | null {
 
 // ---------- sessoes ----------
 const sha256 = (s: string) => crypto.createHash('sha256').update(s).digest('hex');
-function createSession(device: string): { token: string; expires: number } {
+function createSession(device: string, userId: number): { token: string; expires: number } {
     const token = crypto.randomBytes(32).toString('base64url');
     const now = Date.now();
-    db.prepare('INSERT INTO sessions (token_hash, created_at, expires_at, device) VALUES (?,?,?,?)')
-        .run(sha256(token), now, now + SESSION_TTL_MS, device.slice(0, 80));
+    db.prepare('INSERT INTO sessions (token_hash, created_at, expires_at, device, user_id) VALUES (?,?,?,?,?)')
+        .run(sha256(token), now, now + SESSION_TTL_MS, device.slice(0, 80), userId);
     return { token, expires: now + SESSION_TTL_MS };
 }
-function sessionFromCookie(req: http.IncomingMessage): { token: string; device: string } | null {
+function sessionFromCookie(req: http.IncomingMessage): { token: string; device: string; userId: number } | null {
     const raw = req.headers.cookie || '';
     const m = /(?:^|;\s*)dindin_s=([A-Za-z0-9_-]+)/.exec(raw);
     if (!m) return null;
     const token = m[1];
-    const row = db.prepare('SELECT created_at, expires_at, device FROM sessions WHERE token_hash = ?').get(sha256(token)) as any;
+    const row = db.prepare('SELECT s.created_at, s.expires_at, s.device, s.user_id, u.active FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?').get(sha256(token)) as any;
     if (!row) return null;
+    if (!row.active) { db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token)); return null; } // usuario desativado: sessao morre aqui
     const now = Date.now();
     if (now > row.expires_at || now > row.created_at + SESSION_MAX_MS) {
         db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
         return null;
     }
     db.prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?').run(now + SESSION_TTL_MS, sha256(token)); // deslizante
-    return { token, device: row.device };
+    return { token, device: row.device, userId: row.user_id };
 }
 function cookieHeader(token: string, maxAgeSec: number): string {
     return `dindin_s=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}`;
@@ -95,18 +142,19 @@ function cookieHeader(token: string, maxAgeSec: number): string {
 // validade opcional (expires_at NULL = sem prazo), revogavel apagando a linha.
 // O nome do token vira o "device" no historico de alteracoes.
 // Escopos previstos: read | tx:create | tx:edit | tx:delete (sessao de login pode tudo).
-interface Auth { kind: 'session' | 'service'; device: string; scopes?: Set<string> }
+interface Auth { kind: 'session' | 'service'; device: string; scopes?: Set<string>; userId: number }
 const VALID_SCOPES = new Set(['read', 'tx:create', 'tx:edit', 'tx:delete']);
 const touchLastUsed = db.prepare('UPDATE service_tokens SET last_used_at = ? WHERE token_hash = ? AND (last_used_at IS NULL OR last_used_at < ?)');
 function serviceFromHeader(req: http.IncomingMessage): Auth | null {
     const m = /^Bearer (dindin_svc_[A-Za-z0-9_-]{20,80})$/.exec(String(req.headers.authorization || ''));
     if (!m) return null;
     const hash = sha256(m[1]);
-    const row = db.prepare('SELECT label, scopes, expires_at FROM service_tokens WHERE token_hash = ?').get(hash) as any;
+    const row = db.prepare('SELECT t.label, t.scopes, t.expires_at, t.user_id, u.active FROM service_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ?').get(hash) as any;
     if (!row) return null;
+    if (!row.active) return null; // dono desativado: token morre aqui
     if (row.expires_at && Date.now() > row.expires_at) return null; // vencido: trata como inexistente
     touchLastUsed.run(Date.now(), hash, Date.now() - 60000);
-    return { kind: 'service', device: row.label, scopes: new Set(String(row.scopes).split(',')) };
+    return { kind: 'service', device: row.label, scopes: new Set(String(row.scopes).split(',')), userId: row.user_id };
 }
 function validNewTx(data: any): boolean {
     return data && typeof data === 'object' && !Array.isArray(data)
@@ -164,23 +212,23 @@ function readBody(req: http.IncomingMessage): Promise<any> {
         req.on('error', reject);
     });
 }
-const hasUser = () => !!db.prepare('SELECT 1 FROM users WHERE id = 1').get();
+const hasUser = () => !!db.prepare('SELECT 1 FROM users LIMIT 1').get();
 const clientIp = (req: http.IncomingMessage) => (req.headers['x-forwarded-for'] as string || '').split(',')[0].trim() || req.socket.remoteAddress || '?';
 
 // ---------- sync ----------
 interface SyncOp { entity: string; id: string; op: string; data?: unknown; ts?: number; }
-function applyOps(device: string, ops: SyncOp[]): { applied: number; results: any[] } {
+function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: number; results: any[] } {
     const results: any[] = [];
     let applied = 0;
-    const getRec = db.prepare('SELECT updated_at, deleted, data FROM records WHERE entity = ? AND id = ?');
-    const upRec = db.prepare(`INSERT INTO records (entity, id, updated_at, deleted, data) VALUES (@entity,@id,@updated_at,@deleted,@data)
-        ON CONFLICT(entity,id) DO UPDATE SET updated_at=excluded.updated_at, deleted=excluded.deleted, data=excluded.data`);
-    const addHist = db.prepare('INSERT INTO history (ts, device, entity, rid, op, before, after) VALUES (?,?,?,?,?,?,?)');
+    const getRec = db.prepare('SELECT updated_at, deleted, data FROM records WHERE entity = ? AND id = ? AND owner = ?');
+    const upRec = db.prepare(`INSERT INTO records (entity, id, owner, updated_at, deleted, data) VALUES (@entity,@id,@owner,@updated_at,@deleted,@data)
+        ON CONFLICT(entity,id,owner) DO UPDATE SET updated_at=excluded.updated_at, deleted=excluded.deleted, data=excluded.data`);
+    const addHist = db.prepare('INSERT INTO history (ts, device, entity, rid, op, before, after, owner) VALUES (?,?,?,?,?,?,?,?)');
     const tx = db.transaction((list: SyncOp[]) => {
         for (const o of list) {
             if (!ENTITIES.has(o.entity) || typeof o.id !== 'string' || !o.id || o.id.length > 120) { results.push({ id: o?.id, status: 'invalid' }); continue; }
             const ts = Number(o.ts) > 0 ? Math.min(Number(o.ts), Date.now() + 5 * 60 * 1000) : Date.now();
-            const cur = getRec.get(o.entity, o.id) as any;
+            const cur = getRec.get(o.entity, o.id, userId) as any;
             if (cur && cur.updated_at > ts) {
                 results.push({ id: o.id, status: 'skipped', server: cur.deleted ? null : JSON.parse(cur.data), deleted: !!cur.deleted, updated_at: cur.updated_at });
                 continue; // ultima edicao vence: a do servidor e mais nova
@@ -188,15 +236,15 @@ function applyOps(device: string, ops: SyncOp[]): { applied: number; results: an
             const before = cur && !cur.deleted ? cur.data : null;
             if (o.op === 'delete') {
                 if (!cur || cur.deleted) { results.push({ id: o.id, status: 'applied' }); continue; }
-                upRec.run({ entity: o.entity, id: o.id, updated_at: ts, deleted: 1, data: cur.data });
-                addHist.run(Date.now(), device, o.entity, o.id, 'delete', before, null);
+                upRec.run({ entity: o.entity, id: o.id, owner: userId, updated_at: ts, deleted: 1, data: cur.data });
+                addHist.run(Date.now(), device, o.entity, o.id, 'delete', before, null, userId);
                 applied++; results.push({ id: o.id, status: 'applied' });
             } else if (o.op === 'upsert') {
                 if (o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
                 const data = JSON.stringify(o.data);
                 if (data.length > 200000) { results.push({ id: o.id, status: 'invalid' }); continue; }
-                upRec.run({ entity: o.entity, id: o.id, updated_at: ts, deleted: 0, data });
-                addHist.run(Date.now(), device, o.entity, o.id, cur && !cur.deleted ? 'update' : 'create', before, data);
+                upRec.run({ entity: o.entity, id: o.id, owner: userId, updated_at: ts, deleted: 0, data });
+                addHist.run(Date.now(), device, o.entity, o.id, cur && !cur.deleted ? 'update' : 'create', before, data, userId);
                 applied++; results.push({ id: o.id, status: 'applied' });
             } else {
                 results.push({ id: o.id, status: 'invalid' });
@@ -229,9 +277,9 @@ const server = http.createServer(async (req, res) => {
             const issue = passwordIssues(body.password);
             if (issue) return send(res, 400, { error: issue });
             if (body.password !== body.confirm) return send(res, 400, { error: 'As duas senhas não conferem.' });
-            db.prepare('INSERT INTO users (id, username, pass_hash, created_at) VALUES (1, ?, ?, ?)').run(user, hashPassword(body.password), Date.now());
+            db.prepare('INSERT INTO users (id, username, pass_hash, created_at, is_admin, active) VALUES (1, ?, ?, ?, 1, 1)').run(user, hashPassword(body.password), Date.now());
             const device = String(body.device || '').slice(0, 80);
-            const s = createSession(device);
+            const s = createSession(device, 1);
             return send(res, 200, { ok: true }, { 'set-cookie': cookieHeader(s.token, SESSION_TTL_MS / 1000) });
         }
 
@@ -240,12 +288,12 @@ const server = http.createServer(async (req, res) => {
             const lock = lockInfo(key);
             if (lock.locked) return send(res, 429, { error: `Muitas tentativas. Tente de novo em ${Math.ceil(lock.waitSec / 60)} min.`, waitSec: lock.waitSec });
             const body = await readBody(req);
-            const row = db.prepare('SELECT pass_hash FROM users WHERE username = ?').get(normUser(body.username)) as any;
+            const row = db.prepare('SELECT id, pass_hash, active FROM users WHERE username = ?').get(normUser(body.username)) as any;
             const ok = verifyPassword(String(body.password ?? ''), row ? row.pass_hash : DUMMY_HASH);
-            if (!row || !ok) { noteFail(key); return send(res, 401, { error: 'Usuário ou senha incorretos.' }); }
+            if (!row || !row.active || !ok) { noteFail(key); return send(res, 401, { error: 'Usuário ou senha incorretos.' }); } // desativado: mesmo erro generico, sem revelar
             clearFails(key);
             const device = String(body.device || '').slice(0, 80);
-            const s = createSession(device);
+            const s = createSession(device, row.id);
             return send(res, 200, { ok: true }, { 'set-cookie': cookieHeader(s.token, SESSION_TTL_MS / 1000) });
         }
 
@@ -255,7 +303,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         // daqui para baixo: so autenticado (sessao de login OU token de servico)
-        const auth: Auth | null = sess ? { kind: 'session', device: sess.device } : serviceFromHeader(req);
+        const auth: Auth | null = sess ? { kind: 'session', device: sess.device, userId: sess.userId } : serviceFromHeader(req);
         if (!auth) return send(res, 401, { error: 'Entre com a sua senha.' });
         if (!hasUser()) return send(res, 409, { error: 'Setup pendente.' });
         if (auth.kind === 'service') {
@@ -267,7 +315,7 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'GET' && p === '/api/state') {
             const out: Record<string, any[]> = {};
             for (const e of ENTITIES) out[e] = [];
-            const rows = db.prepare('SELECT entity, data FROM records WHERE deleted = 0').all() as any[];
+            const rows = db.prepare('SELECT entity, data FROM records WHERE deleted = 0 AND owner = ?').all(auth.userId) as any[];
             for (const r of rows) out[r.entity].push(JSON.parse(r.data));
             return send(res, 200, { serverTime: Date.now(), records: out });
         }
@@ -279,10 +327,10 @@ const server = http.createServer(async (req, res) => {
                 const can = (sc: string) => auth.scopes!.has(sc);
                 const ops = Array.isArray(body.ops) ? body.ops.slice(0, 50) : [];
                 if (!ops.length) return send(res, 400, { error: 'Nada para lançar.' });
-                const exists = db.prepare('SELECT deleted FROM records WHERE entity = ? AND id = ?');
+                const exists = db.prepare('SELECT deleted FROM records WHERE entity = ? AND id = ? AND owner = ?');
                 for (const o of ops) {
                     if (o?.entity !== 'tx') return send(res, 403, { error: 'Este acesso só lança despesas e receitas.' });
-                    const cur = exists.get('tx', String(o?.id || '')) as any;
+                    const cur = exists.get('tx', String(o?.id || ''), auth.userId) as any;
                     if (o.op === 'delete') {
                         if (!can('tx:delete')) return send(res, 403, { error: 'Este acesso não pode apagar lançamentos.' });
                     } else if (o.op === 'upsert') {
@@ -295,18 +343,18 @@ const server = http.createServer(async (req, res) => {
                         return send(res, 400, { error: 'Operação inválida.' });
                     }
                 }
-                const r = applyOps(auth.device, ops);
+                const r = applyOps(auth.device, auth.userId, ops);
                 return send(res, 200, { serverTime: Date.now(), applied: r.applied, results: r.results });
             }
             const ops = Array.isArray(body.ops) ? body.ops.slice(0, 2000) : [];
             const device = String(body.device || auth.device || '').slice(0, 80);
-            const r = applyOps(device, ops);
+            const r = applyOps(device, auth.userId, ops);
             return send(res, 200, { serverTime: Date.now(), applied: r.applied, results: r.results });
         }
 
         if (req.method === 'GET' && p === '/api/service-tokens') {
             if (auth.kind !== 'session') return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
-            const rows = db.prepare('SELECT label, scopes, created_at, expires_at, last_used_at FROM service_tokens ORDER BY created_at DESC').all() as any[];
+            const rows = db.prepare('SELECT label, scopes, created_at, expires_at, last_used_at FROM service_tokens WHERE user_id = ? ORDER BY created_at DESC').all(auth.userId) as any[];
             return send(res, 200, {
                 tokens: rows.map(r => ({ label: r.label, scopes: String(r.scopes).split(','), created_at: r.created_at, expires_at: r.expires_at, last_used_at: r.last_used_at })),
             });
@@ -319,12 +367,12 @@ const server = http.createServer(async (req, res) => {
             const scopes: string[] = Array.isArray(body.scopes) ? body.scopes.map(String) : [];
             if (!label) return send(res, 400, { error: 'Dê um nome para o acesso (ex.: Instinct WhatsApp).' });
             if (!scopes.length || scopes.some(sc => !VALID_SCOPES.has(sc))) return send(res, 400, { error: 'Permissões inválidas.' });
-            const dup = db.prepare('SELECT 1 AS x FROM service_tokens WHERE label = ?').get(label);
+            const dup = db.prepare('SELECT 1 AS x FROM service_tokens WHERE label = ? AND user_id = ?').get(label, auth.userId);
             if (dup) return send(res, 409, { error: 'Já existe um acesso com esse nome. Revogue-o antes de criar outro.' });
             const days = Number(body.expiresDays) || 0; // 0/ausente = sem validade
             const token = 'dindin_svc_' + crypto.randomBytes(32).toString('base64url');
-            db.prepare('INSERT INTO service_tokens (token_hash, label, scopes, created_at, expires_at, last_used_at) VALUES (?,?,?,?,?,NULL)')
-                .run(sha256(token), label, scopes.join(','), Date.now(), days > 0 ? Date.now() + days * 86400000 : null);
+            db.prepare('INSERT INTO service_tokens (token_hash, label, scopes, created_at, expires_at, last_used_at, user_id) VALUES (?,?,?,?,?,NULL,?)')
+                .run(sha256(token), label, scopes.join(','), Date.now(), days > 0 ? Date.now() + days * 86400000 : null, auth.userId);
             return send(res, 200, { ok: true, token, label, scopes, expires_at: days > 0 ? Date.now() + days * 86400000 : null });
         }
 
@@ -332,7 +380,7 @@ const server = http.createServer(async (req, res) => {
             if (auth.kind !== 'session') return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
             const body = await readBody(req);
             const label = String(body.label || '').slice(0, 80);
-            const n = db.prepare('DELETE FROM service_tokens WHERE label = ?').run(label).changes;
+            const n = db.prepare('DELETE FROM service_tokens WHERE label = ? AND user_id = ?').run(label, auth.userId).changes;
             return send(res, n ? 200 : 404, { ok: !!n, error: n ? undefined : 'Acesso não encontrado.' });
         }
 
@@ -340,8 +388,8 @@ const server = http.createServer(async (req, res) => {
             const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 50, 1), 200);
             const device = String(url.searchParams.get('device') || '').slice(0, 80);
             const rows = (device
-                ? db.prepare('SELECT seq, ts, device, entity, rid, op, before, after FROM history WHERE device = ? ORDER BY seq DESC LIMIT ?').all(device, limit)
-                : db.prepare('SELECT seq, ts, device, entity, rid, op, before, after FROM history ORDER BY seq DESC LIMIT ?').all(limit)) as any[];
+                ? db.prepare('SELECT seq, ts, device, entity, rid, op, before, after FROM history WHERE owner = ? AND device = ? ORDER BY seq DESC LIMIT ?').all(auth.userId, device, limit)
+                : db.prepare('SELECT seq, ts, device, entity, rid, op, before, after FROM history WHERE owner = ? ORDER BY seq DESC LIMIT ?').all(auth.userId, limit)) as any[];
             return send(res, 200, {
                 entries: rows.map(r => ({ ...r, before: r.before ? JSON.parse(r.before) : null, after: r.after ? JSON.parse(r.after) : null })),
             });
