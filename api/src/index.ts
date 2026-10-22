@@ -119,12 +119,12 @@ function createSession(device: string, userId: number): { token: string; expires
         .run(sha256(token), now, now + SESSION_TTL_MS, device.slice(0, 80), userId);
     return { token, expires: now + SESSION_TTL_MS };
 }
-function sessionFromCookie(req: http.IncomingMessage): { token: string; device: string; userId: number } | null {
+function sessionFromCookie(req: http.IncomingMessage): { token: string; device: string; userId: number; username: string; isAdmin: boolean } | null {
     const raw = req.headers.cookie || '';
     const m = /(?:^|;\s*)dindin_s=([A-Za-z0-9_-]+)/.exec(raw);
     if (!m) return null;
     const token = m[1];
-    const row = db.prepare('SELECT s.created_at, s.expires_at, s.device, s.user_id, u.active FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?').get(sha256(token)) as any;
+    const row = db.prepare('SELECT s.created_at, s.expires_at, s.device, s.user_id, u.active, u.username, u.is_admin FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?').get(sha256(token)) as any;
     if (!row) return null;
     if (!row.active) { db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token)); return null; } // usuario desativado: sessao morre aqui
     const now = Date.now();
@@ -133,7 +133,7 @@ function sessionFromCookie(req: http.IncomingMessage): { token: string; device: 
         return null;
     }
     db.prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?').run(now + SESSION_TTL_MS, sha256(token)); // deslizante
-    return { token, device: row.device, userId: row.user_id };
+    return { token, device: row.device, userId: row.user_id, username: row.username, isAdmin: !!row.is_admin };
 }
 function cookieHeader(token: string, maxAgeSec: number): string {
     return `dindin_s=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}`;
@@ -267,7 +267,9 @@ const server = http.createServer(async (req, res) => {
         const sess = sessionFromCookie(req);
 
         if (req.method === 'GET' && p === '/api/auth/status') {
-            return send(res, 200, { setup: hasUser(), authed: !!sess });
+            return send(res, 200, sess
+                ? { setup: hasUser(), authed: true, username: sess.username, isAdmin: sess.isAdmin }
+                : { setup: hasUser(), authed: false });
         }
 
         if (req.method === 'POST' && p === '/api/auth/setup') {

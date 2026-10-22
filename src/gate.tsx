@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { hydrate, startSyncLoop, setAuthLostHandler, deviceLabel } from './sync';
 
-type Stage = 'loading' | 'setup' | 'login' | 'hydrating' | 'ready';
+type Stage = 'loading' | 'setup' | 'login' | 'register' | 'hydrating' | 'ready';
 
 interface HistoryEntry { seq: number; ts: number; device: string; entity: string; rid: string; op: string; before: any; after: any }
 
@@ -55,6 +55,7 @@ export function Gate({ children }: { children: React.ReactNode }) {
     const [err, setErr] = useState('');
     const [busy, setBusy] = useState(false);
     const [showHistory, setShowHistory] = useState(false);
+    const [invite, setInvite] = useState('');
 
     const afterAuth = useCallback(async () => {
         setStage('hydrating');
@@ -64,6 +65,9 @@ export function Gate({ children }: { children: React.ReactNode }) {
 
     useEffect(() => {
         setAuthLostHandler(() => setStage('login'));
+        // Convite chega no fragmento (#convite=...): nao vai para logs nem para o servidor na URL.
+        const m = /#convite=([A-Za-z0-9_-]+)/.exec(window.location.hash);
+        if (m) { setInvite(m[1]); setStage('register'); return; }
         fetch('/api/auth/status', { credentials: 'same-origin' })
             .then(r => r.json())
             .then(b => { if (!b.setup) { setStage('setup'); } else if (!b.authed) setStage('login'); else void afterAuth(); })
@@ -76,6 +80,7 @@ export function Gate({ children }: { children: React.ReactNode }) {
             const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), credentials: 'same-origin' });
             const b = await r.json().catch(() => ({}));
             if (!r.ok) { setErr(b.error || 'Não deu certo. Tente de novo.'); return; }
+            if (path === '/api/auth/register') window.history.replaceState(null, '', window.location.pathname + window.location.search); // tira o convite da URL
             await afterAuth();
         } catch { setErr('Sem conexão com o servidor.'); }
         finally { setBusy(false); }
@@ -96,25 +101,28 @@ export function Gate({ children }: { children: React.ReactNode }) {
     </>;
 
     const isSetup = stage === 'setup';
+    const isRegister = stage === 'register';
+    const newAccount = isSetup || isRegister;
     return <div style={{ minHeight: '100vh', background: '#0f172a', color: '#e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, fontFamily: 'system-ui, sans-serif' }}>
         <div style={{ width: '100%', maxWidth: 360 }}>
             <div style={{ textAlign: 'center', fontSize: 44 }}>💰</div>
             <h1 style={{ textAlign: 'center', fontSize: 24, margin: '8px 0 4px' }}>dindin</h1>
             <p style={{ textAlign: 'center', color: '#94a3b8', marginTop: 0 }}>
-                {stage === 'loading' || stage === 'hydrating' ? 'Carregando…' : isSetup ? 'Primeiro acesso: confirme o usuário e crie a sua senha.' : 'Entre com usuário e senha.'}
+                {stage === 'loading' || stage === 'hydrating' ? 'Carregando…' : isRegister ? 'Você foi convidado! Escolha seu usuário e a sua senha.' : isSetup ? 'Primeiro acesso: confirme o usuário e crie a sua senha.' : 'Entre com usuário e senha.'}
             </p>
-            {(stage === 'setup' || stage === 'login') && <form onSubmit={e => {
+            {(stage === 'setup' || stage === 'login' || stage === 'register') && <form onSubmit={e => {
                 e.preventDefault();
-                if (isSetup) void submit('/api/auth/setup', { username: user, password: pw, confirm: pw2, device: deviceLabel() });
+                if (isRegister) void submit('/api/auth/register', { invite, username: user, password: pw, confirm: pw2, device: deviceLabel() });
+                else if (isSetup) void submit('/api/auth/setup', { username: user, password: pw, confirm: pw2, device: deviceLabel() });
                 else void submit('/api/auth/login', { username: user, password: pw, device: deviceLabel() });
             }}>
-                <input type="text" value={user} onChange={e => setUser(e.target.value)} placeholder="Usuário" autoFocus={!isSetup} style={inputStyle} autoComplete="username" autoCapitalize="off" autoCorrect="off" spellCheck={false} />
-                <input type="password" value={pw} onChange={e => setPw(e.target.value)} placeholder="Senha" autoFocus={isSetup} style={inputStyle} autoComplete={isSetup ? 'new-password' : 'current-password'} />
-                {isSetup && <input type="password" value={pw2} onChange={e => setPw2(e.target.value)} placeholder="Repita a senha" style={inputStyle} autoComplete="new-password" />}
-                {isSetup && <p style={{ fontSize: 13, color: '#94a3b8' }}>Pelo menos 10 caracteres, misturando letras e números. Guarde no Proton Pass.</p>}
+                <input type="text" value={user} onChange={e => setUser(e.target.value)} placeholder="Usuário" autoFocus={!isSetup && !isRegister} style={inputStyle} autoComplete="username" autoCapitalize="off" autoCorrect="off" spellCheck={false} />
+                <input type="password" value={pw} onChange={e => setPw(e.target.value)} placeholder="Senha" autoFocus={isSetup || isRegister} style={inputStyle} autoComplete={newAccount ? 'new-password' : 'current-password'} />
+                {newAccount && <input type="password" value={pw2} onChange={e => setPw2(e.target.value)} placeholder="Repita a senha" style={inputStyle} autoComplete="new-password" />}
+                {newAccount && <p style={{ fontSize: 13, color: '#94a3b8' }}>Pelo menos 10 caracteres, misturando letras e números. Guarde no seu gerenciador de senhas.</p>}
                 {err && <p style={{ color: '#f87171', fontSize: 14 }}>{err}</p>}
-                <button type="submit" disabled={busy || !user.trim() || !pw || (isSetup && !pw2)} style={{ ...btnStyle, opacity: busy || !user.trim() || !pw || (isSetup && !pw2) ? .5 : 1 }}>
-                    {busy ? 'Um momento…' : isSetup ? 'Criar senha e entrar' : 'Entrar'}
+                <button type="submit" disabled={busy || !user.trim() || !pw || (newAccount && !pw2)} style={{ ...btnStyle, opacity: busy || !user.trim() || !pw || (newAccount && !pw2) ? .5 : 1 }}>
+                    {busy ? 'Um momento…' : isRegister ? 'Criar a minha conta' : isSetup ? 'Criar senha e entrar' : 'Entrar'}
                 </button>
             </form>}
         </div>

@@ -649,6 +649,98 @@ function AIAccessSheet({ onClose }: { onClose: () => void }) {
     </>;
 }
 
+// ---------- Administracao (convites e usuarios; so aparece para o admin) ----------
+interface AdminUser { id: number; username: string; created_at: number; is_admin: boolean; active: boolean }
+interface InviteRow { ref: string; created_at: number; expires_at: number; used_at: number | null; by: string; status: string }
+
+function AdminSheet({ onClose }: { onClose: () => void }) {
+    const [users, setUsers] = useState<AdminUser[] | null>(null);
+    const [invites, setInvites] = useState<InviteRow[] | null>(null);
+    const [me, setMe] = useState('');
+    const [err, setErr] = useState('');
+    const [busy, setBusy] = useState(false);
+    const [created, setCreated] = useState<{ link: string; expires_at: number } | null>(null);
+    const [copied, setCopied] = useState(false);
+    const [confirmToggle, setConfirmToggle] = useState(0);
+
+    const load = () => {
+        fetch('/api/auth/status', { credentials: 'same-origin' })
+            .then(r => r.ok ? r.json() : null)
+            .then(b => { if (b && b.username) setMe(b.username); })
+            .catch(() => {});
+        fetch('/api/admin/users', { credentials: 'same-origin' })
+            .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+            .then(b => setUsers(b.users || []))
+            .catch(() => setErr('Não consegui carregar os usuários agora.'));
+        fetch('/api/admin/invites', { credentials: 'same-origin' })
+            .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+            .then(b => setInvites(b.invites || []))
+            .catch(() => setErr('Não consegui carregar os convites agora.'));
+    };
+    useEffect(load, []);
+
+    const createInvite = async () => {
+        setBusy(true); setErr('');
+        try {
+            const r = await fetch('/api/admin/invites', { method: 'POST', credentials: 'same-origin' });
+            const b = await r.json().catch(() => ({}));
+            if (!r.ok) { setErr(b.error || 'Não deu certo. Tente de novo.'); return; }
+            setCreated({ link: b.link, expires_at: b.expires_at }); setCopied(false); load();
+        } catch { setErr('Sem conexão com o servidor.'); }
+        finally { setBusy(false); }
+    };
+
+    const copy = async () => {
+        try { await navigator.clipboard.writeText(created!.link); setCopied(true); }
+        catch { /* o campo é selecionável: dá para copiar na mão */ }
+    };
+
+    const toggle = async (u: AdminUser) => {
+        setBusy(true); setErr('');
+        try {
+            const r = await fetch('/api/admin/users/active', {
+                method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ userId: u.id, active: !u.active }),
+            });
+            const b = await r.json().catch(() => ({}));
+            if (!r.ok) { setErr(b.error || 'Não deu certo. Tente de novo.'); return; }
+            setConfirmToggle(0); load();
+        } catch { setErr('Sem conexão com o servidor.'); }
+        finally { setBusy(false); }
+    };
+
+    return <>
+        <div className="sheethead"><h2>Administração</h2><button className="sheetx" aria-label="Fechar" onClick={onClose}>✕</button></div>
+        {err && <p className="error">{err}</p>}
+
+        <h3 className="admsection">Convites</h3>
+        <p className="hint">O link vale 3 dias e só pode ser usado uma vez. O convidado escolhe o próprio usuário e senha.</p>
+        {created && <>
+            <textarea className="backuptext tokencode" readOnly value={created.link} onFocus={e => e.target.select()} rows={3} />
+            <button className="sheetbtn primary" onClick={() => void copy()}>{copied ? '✓ Copiado — mande para a pessoa' : '📋 Copiar link do convite'}</button>
+            <p className="hint">Válido até {fmtDay(created.expires_at)}. Se vencer, crie outro.</p>
+        </>}
+        <button className="sheetbtn primary" disabled={busy} onClick={() => void createInvite()}>+ Criar convite</button>
+        {invites && invites.length > 0 && <div className="aitoken-meta" style={{ marginTop: 10 }}>
+            {invites.map(i => <div key={i.ref}>convite {i.ref} · {i.status}{i.status === 'ativo' ? ' · vale até ' + fmtDay(i.expires_at) : ''}</div>)}
+        </div>}
+
+        <h3 className="admsection">Usuários</h3>
+        <p className="hint">Você gerencia o acesso, mas não vê os lançamentos de ninguém.</p>
+        {users === null && !err && <p className="hint">Carregando…</p>}
+        {users && users.map(u => <div key={u.id} className="aitoken">
+            <div className="aitoken-name">{u.username}{u.is_admin ? ' · admin' : ''}{u.username === me ? ' (você)' : ''}</div>
+            <div className="aitoken-meta">desde {fmtDay(u.created_at)} · {u.active ? 'ativo' : 'desativado'}</div>
+            {u.username !== me && (confirmToggle === u.id
+                ? <button className={u.active ? 'sheetbtn danger' : 'sheetbtn primary'} disabled={busy} onClick={() => void toggle(u)}>
+                    {u.active ? 'Confirmar: a pessoa perde o acesso na hora' : 'Confirmar reativação'}</button>
+                : <button className="sheetbtn" disabled={busy} onClick={() => setConfirmToggle(u.id)}>
+                    {u.active ? 'Desativar acesso' : 'Reativar acesso'}</button>)}
+        </div>)}
+        <button className="sheetbtn ghost" onClick={onClose}>Fechar</button>
+    </>;
+}
+
 function StorageMeter({ txs, cats, recs }: { txs: Tx[]; cats: Category[]; recs: Rec[] }) {
     // Mede a COPIA OFFLINE no aparelho (localStorage do navegador). A fonte da
     // verdade e o banco na VM; isto e so o cache local para o app abrir offline.
@@ -698,6 +790,14 @@ export function App() {
     const [editing, setEditing] = useState<Tx | null>(null);
     const [menuOpen, setMenuOpen] = useState(false);
     const [showAIAccess, setShowAIAccess] = useState(false);
+    const [isAdmin, setIsAdmin] = useState(false);
+    const [showAdmin, setShowAdmin] = useState(false);
+    useEffect(() => {
+        fetch('/api/auth/status', { credentials: 'same-origin' })
+            .then(r => r.ok ? r.json() : null)
+            .then(b => setIsAdmin(!!(b && b.isAdmin)))
+            .catch(() => {});
+    }, []);
     const [showCatRules, setShowCatRules] = useState(false);
     const [selCat, setSelCat] = useState<string | null>(null);
     const [showInstall, setShowInstall] = useState(false);
@@ -1308,6 +1408,7 @@ export function App() {
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); restoreInput.current && restoreInput.current.click(); }}>↩️ Restaurar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowInstall(true); }}>📲 Instalar na tela de início</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowAIAccess(true); }}>🤖 Acessos de IA</button>
+                    {isAdmin && <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowAdmin(true); }}>🛡️ Administração</button>}
                     <StorageMeter txs={txs} cats={cats} recs={recs} />
                     <button className="sheetbtn ghost" onClick={() => setMenuOpen(false)}>Fechar</button>
                 </div>
@@ -1316,6 +1417,12 @@ export function App() {
             {showAIAccess && <Overlay onClose={() => setShowAIAccess(false)}>
                 <div className="sheet" onClick={e => e.stopPropagation()}>
                     <AIAccessSheet onClose={() => setShowAIAccess(false)} />
+                </div>
+            </Overlay>}
+
+            {showAdmin && <Overlay onClose={() => setShowAdmin(false)}>
+                <div className="sheet" onClick={e => e.stopPropagation()}>
+                    <AdminSheet onClose={() => setShowAdmin(false)} />
                 </div>
             </Overlay>}
 
