@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocalState } from './localState';
 import { decryptBackupJson, encryptBackupJson, isEncryptedBackup } from './crypto';
 import { HistoryModal } from './gate';
+import { capFirst } from './format';
 import './style.css';
 import heroImg from './photos/hero.png';
 
@@ -1698,7 +1699,7 @@ function TxForm(props: {
         props.onSave({
             id: initial ? initial.id : uid(),
             type,
-            desc: desc.trim() || (type === 'despesa' ? 'Despesa' : 'Receita'),
+            desc: capFirst(desc.trim()) || (type === 'despesa' ? 'Despesa' : 'Receita'),
             cat: chosenCat,
             cents,
             date,
@@ -1776,7 +1777,7 @@ function RecForm(props: {
         const dueDay = Math.round(Number(dia));
         if (!isFinite(dueDay) || dueDay < 1 || dueDay > 31) { setErr('O dia de vencimento precisa ser entre 1 e 31.'); return; }
         if (!desc.trim()) { setErr('Dê um nome para a conta fixa.'); return; }
-        props.onSave({ id: initial ? initial.id : uid(), desc: desc.trim(), cat: chosenCat, cents, dueDay });
+        props.onSave({ id: initial ? initial.id : uid(), desc: capFirst(desc.trim()), cat: chosenCat, cents, dueDay });
     };
 
     return <Overlay>

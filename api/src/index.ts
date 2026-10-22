@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import { capFirst } from './format.js';
 
 const PORT = Number(process.env.PORT || 3100);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -330,6 +331,9 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                 applied++; results.push({ id: o.id, status: 'applied' });
             } else if (o.op === 'upsert') {
                 if (o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                // Descricao sempre com inicial maiuscula (tx e conta fixa), qualquer que seja o escritor.
+                const rec = o.data as Record<string, unknown>;
+                if ((o.entity === 'tx' || o.entity === 'rec') && typeof rec.desc === 'string') o.data = { ...rec, desc: capFirst(rec.desc) };
                 const data = JSON.stringify(o.data);
                 if (data.length > 200000) { results.push({ id: o.id, status: 'invalid' }); continue; }
                 upRec.run({ entity: o.entity, id: o.id, owner: userId, updated_at: ts, deleted: 0, data });
