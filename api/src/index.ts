@@ -131,6 +131,67 @@ function migrateCatsIfNeeded(): void {
 }
 migrateCatsIfNeeded();
 
+// Migracao v4: lancamentos ganham tabela propria (transactions), com colunas de
+// verdade e chave estrangeira para a categoria. ADITIVA como a v3: copia de
+// records e nao apaga nada — os registros antigos ficam intactos (copia fria).
+// Etapa 0: qualquer problema (registro invalido, campo desconhecido ou categoria
+// orfa) ABORTA o boot e lista um a um — correcao so com decisao humana.
+const TX_KEYS = new Set(['id', 'date', 'desc', 'cat', 'cents', 'type', 'recKey', 'fitid']);
+function migrateTxsIfNeeded(): void {
+    const v = db.prepare("SELECT v FROM meta WHERE k = 'schema_v'").get() as any;
+    if (v && Number(v.v) >= 4) return;
+    db.exec(`CREATE TABLE IF NOT EXISTS transactions (
+        owner INTEGER NOT NULL REFERENCES users(id),
+        id TEXT NOT NULL,
+        date TEXT NOT NULL,
+        description TEXT NOT NULL,
+        cat TEXT NOT NULL,
+        cents INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        rec_key TEXT,
+        fitid TEXT,
+        updated_at INTEGER NOT NULL,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (owner, id),
+        FOREIGN KEY (owner, cat) REFERENCES categories(owner, id)
+    )`);
+    const rows = db.prepare("SELECT owner, id, updated_at, deleted, data FROM records WHERE entity = 'tx'").all() as any[];
+    const catExists = db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?');
+    const problems: string[] = [];
+    for (const r of rows) {
+        let d: any = null;
+        try { d = JSON.parse(r.data); } catch { /* cai no invalido abaixo */ }
+        if (!d || typeof d !== 'object' || !validNewTx(d) || d.id !== r.id) {
+            problems.push('dono=' + r.owner + ' id=' + r.id + ' apagado=' + (r.deleted ? 'sim' : 'nao') + ' motivo=registro invalido (' + String(r.data).slice(0, 80) + ')');
+            continue;
+        }
+        const extra = Object.keys(d).filter(k => !TX_KEYS.has(k));
+        if (extra.length) {
+            problems.push('dono=' + r.owner + ' id=' + r.id + ' motivo=campos desconhecidos: ' + extra.join(', ') + ' (a tabela nova nao teria onde guarda-los)');
+            continue;
+        }
+        if (!catExists.get(r.owner, String(d.cat))) {
+            problems.push('dono=' + r.owner + ' id=' + r.id + ' data=' + d.date + ' desc="' + d.desc + '" apagado=' + (r.deleted ? 'sim' : 'nao') + ' motivo=categoria orfa "' + d.cat + '"');
+        }
+    }
+    if (problems.length) {
+        console.error('MIGRACAO v4 ABORTADA - ' + problems.length + ' lancamento(s) com problema:');
+        for (const p of problems) console.error('  ' + p);
+        throw new Error('migracao v4 abortada: resolver os lancamentos listados acima antes');
+    }
+    const ins = db.prepare('INSERT INTO transactions (owner, id, date, description, cat, cents, type, rec_key, fitid, updated_at, deleted) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
+    const txm = db.transaction((list: any[]) => {
+        for (const r of list) {
+            const d = JSON.parse(r.data);
+            ins.run(r.owner, r.id, String(d.date), String(d.desc), String(d.cat), d.cents, d.type, d.recKey ? String(d.recKey) : null, d.fitid ? String(d.fitid) : null, r.updated_at, r.deleted);
+        }
+    });
+    txm(rows);
+    db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_v', '4')").run();
+    console.log('migracao v4 (tabela transactions: ' + rows.length + ' copiados, registros antigos mantidos) aplicada');
+}
+migrateTxsIfNeeded();
+
 // ---------- senha (scrypt) ----------
 function hashPassword(pw: string): string {
     const salt = crypto.randomBytes(16);
@@ -281,7 +342,13 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
         ON CONFLICT(entity,id,owner) DO UPDATE SET updated_at=excluded.updated_at, deleted=excluded.deleted, data=excluded.data`);
     const addHist = db.prepare('INSERT INTO history (ts, device, entity, rid, op, before, after, owner) VALUES (?,?,?,?,?,?,?,?)');
     const tx = db.transaction((list: SyncOp[]) => {
-        for (const o of list) {
+        // Lancamentos por ultimo: se o mesmo lote cria a categoria e o lancamento,
+        // a categoria ja existe quando o lancamento chega (chave estrangeira).
+        // A ordem entre ops da mesma entidade se mantem; o app le results por
+        // status/id (nao por posicao) e o caminho de token e so de lancamentos
+        // (ordem identica), entao reordenar aqui e seguro.
+        const ordered = [...list].sort((a, b) => (a?.entity === 'tx' ? 1 : 0) - (b?.entity === 'tx' ? 1 : 0));
+        for (const o of ordered) {
             if (!ENTITIES.has(o.entity) || typeof o.id !== 'string' || !o.id || o.id.length > 120) { results.push({ id: o?.id, status: 'invalid' }); continue; }
             const ts = Number(o.ts) > 0 ? Math.min(Number(o.ts), Date.now() + 5 * 60 * 1000) : Date.now();
             // --- categorias vivem na tabela categories (unicidade garantida pelo banco) ---
@@ -318,6 +385,42 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                 applied++; results.push({ id: o.id, status: 'applied' });
                 continue;
             }
+            // --- lancamentos vivem na tabela transactions (v4): colunas de verdade, categoria com chave estrangeira ---
+            if (o.entity === 'tx') {
+                const curTx = db.prepare('SELECT date, description, cat, cents, type, rec_key, fitid, updated_at, deleted FROM transactions WHERE owner = ? AND id = ?').get(userId, o.id) as any;
+                const txJson = (t: any) => JSON.stringify({ id: o.id, date: t.date, desc: t.description, cat: t.cat, cents: t.cents, type: t.type, ...(t.rec_key ? { recKey: t.rec_key } : {}), ...(t.fitid ? { fitid: t.fitid } : {}) });
+                if (curTx && curTx.updated_at > ts) {
+                    results.push({ id: o.id, status: 'skipped', server: curTx.deleted ? null : JSON.parse(txJson(curTx)), deleted: !!curTx.deleted, updated_at: curTx.updated_at });
+                    continue; // ultima edicao vence: a do servidor e mais nova
+                }
+                if (o.op === 'delete') {
+                    if (curTx && !curTx.deleted) {
+                        db.prepare('UPDATE transactions SET deleted = 1, updated_at = ? WHERE owner = ? AND id = ?').run(ts, userId, o.id);
+                        addHist.run(Date.now(), device, 'tx', o.id, 'delete', txJson(curTx), null, userId);
+                        applied++;
+                    }
+                    results.push({ id: o.id, status: 'applied' });
+                    continue;
+                }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                const d = o.data as any;
+                if (d.id !== o.id || !validNewTx(d)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                // a categoria precisa existir (chave estrangeira): avisa bonito em vez de estourar o lote
+                if (!db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?').get(userId, String(d.cat))) {
+                    results.push({ id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
+                    continue;
+                }
+                const desc = capFirst(String(d.desc));
+                const recKey = d.recKey ? String(d.recKey) : null;
+                const fitid = d.fitid ? String(d.fitid) : null;
+                db.prepare(`INSERT INTO transactions (owner, id, date, description, cat, cents, type, rec_key, fitid, updated_at, deleted) VALUES (?,?,?,?,?,?,?,?,?,?,0)
+                    ON CONFLICT(owner, id) DO UPDATE SET date=excluded.date, description=excluded.description, cat=excluded.cat, cents=excluded.cents, type=excluded.type, rec_key=excluded.rec_key, fitid=excluded.fitid, updated_at=excluded.updated_at, deleted=0`)
+                    .run(userId, o.id, String(d.date), desc, String(d.cat), d.cents, d.type, recKey, fitid, ts);
+                const after = JSON.stringify({ id: o.id, date: String(d.date), desc, cat: String(d.cat), cents: d.cents, type: d.type, ...(recKey ? { recKey } : {}), ...(fitid ? { fitid } : {}) });
+                addHist.run(Date.now(), device, 'tx', o.id, curTx && !curTx.deleted ? 'update' : 'create', curTx && !curTx.deleted ? txJson(curTx) : null, after, userId);
+                applied++; results.push({ id: o.id, status: 'applied' });
+                continue;
+            }
             const cur = getRec.get(o.entity, o.id, userId) as any;
             if (cur && cur.updated_at > ts) {
                 results.push({ id: o.id, status: 'skipped', server: cur.deleted ? null : JSON.parse(cur.data), deleted: !!cur.deleted, updated_at: cur.updated_at });
@@ -331,9 +434,10 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                 applied++; results.push({ id: o.id, status: 'applied' });
             } else if (o.op === 'upsert') {
                 if (o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
-                // Descricao sempre com inicial maiuscula (tx e conta fixa), qualquer que seja o escritor.
+                // Descricao de conta fixa sempre com inicial maiuscula, qualquer que seja o escritor
+                // (lancamento e capitalizado no caminho proprio, acima).
                 const rec = o.data as Record<string, unknown>;
-                if ((o.entity === 'tx' || o.entity === 'rec') && typeof rec.desc === 'string') o.data = { ...rec, desc: capFirst(rec.desc) };
+                if (o.entity === 'rec' && typeof rec.desc === 'string') o.data = { ...rec, desc: capFirst(rec.desc) };
                 const data = JSON.stringify(o.data);
                 if (data.length > 200000) { results.push({ id: o.id, status: 'invalid' }); continue; }
                 upRec.run({ entity: o.entity, id: o.id, owner: userId, updated_at: ts, deleted: 0, data });
@@ -489,11 +593,14 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'GET' && p === '/api/state') {
             const out: Record<string, any[]> = {};
             for (const e of ENTITIES) out[e] = [];
-            const rows = db.prepare("SELECT entity, data FROM records WHERE deleted = 0 AND owner = ? AND entity != 'cat'").all(auth.userId) as any[];
+            const rows = db.prepare("SELECT entity, data FROM records WHERE deleted = 0 AND owner = ? AND entity NOT IN ('cat', 'tx')").all(auth.userId) as any[];
             for (const r of rows) out[r.entity].push(JSON.parse(r.data));
             // categorias vem da tabela (fonte da verdade), no mesmo formato de record que o app espera
             const catRows = db.prepare('SELECT id, label, icon, color, type FROM categories WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
             for (const c of catRows) out['cat'].push({ id: c.id, label: c.label, icon: c.icon, color: c.color, type: c.type });
+            // lancamentos vem da tabela (fonte da verdade), no mesmo formato JSON que o app espera
+            const txRows = db.prepare('SELECT id, date, description, cat, cents, type, rec_key, fitid FROM transactions WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
+            for (const t of txRows) out['tx'].push({ id: t.id, date: t.date, desc: t.description, cat: t.cat, cents: t.cents, type: t.type, ...(t.rec_key ? { recKey: t.rec_key } : {}), ...(t.fitid ? { fitid: t.fitid } : {}) });
             return send(res, 200, { serverTime: Date.now(), records: out });
         }
 
@@ -504,10 +611,10 @@ const server = http.createServer(async (req, res) => {
                 const can = (sc: string) => auth.scopes!.has(sc);
                 const ops = Array.isArray(body.ops) ? body.ops.slice(0, 50) : [];
                 if (!ops.length) return send(res, 400, { error: 'Nada para lançar.' });
-                const exists = db.prepare('SELECT deleted FROM records WHERE entity = ? AND id = ? AND owner = ?');
+                const exists = db.prepare('SELECT deleted FROM transactions WHERE owner = ? AND id = ?');
                 for (const o of ops) {
                     if (o?.entity !== 'tx') return send(res, 403, { error: 'Este acesso só lança despesas e receitas.' });
-                    const cur = exists.get('tx', String(o?.id || ''), auth.userId) as any;
+                    const cur = exists.get(auth.userId, String(o?.id || '')) as any;
                     if (o.op === 'delete') {
                         if (!can('tx:delete')) return send(res, 403, { error: 'Este acesso não pode apagar lançamentos.' });
                     } else if (o.op === 'upsert') {
