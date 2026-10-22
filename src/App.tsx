@@ -828,7 +828,15 @@ export function App() {
         return () => clearTimeout(t);
     }, [notice]);
 
-    const allCats = useMemo(() => [...DEFAULT_CATS, ...cats], [cats]);
+    // Dedupe so no visual: quando o usuario ja tem uma categoria com o mesmo nome
+    // (ignorando maiuscula/acento), a DELE aparece; a generica embutida fica de fora.
+    // Nada e apagado do banco; lancamentos continuam apontando para o mesmo id.
+    const allCats = useMemo(() => {
+        const norm = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+        const userNames = new Set(cats.map(c => norm(c.label)));
+        const userIds = new Set(cats.map(c => c.id));
+        return [...DEFAULT_CATS.filter(c => !userNames.has(norm(c.label)) && !userIds.has(c.id)), ...cats];
+    }, [cats]);
     const catById = (id: string): Category => {
         const found = allCats.find(c => c.id === id);
         if (found) return found;
@@ -993,7 +1001,13 @@ export function App() {
         setNotice('Conta fixa removida. Os lançamentos já feitos continuam no histórico.');
     };
 
+    // Nome repetido (mesmo nome ignorando acento/maiuscula, tipo compativel): avisa e
+    // SELECIONA a existente em vez de criar duplicada. O banco recusaria de qualquer
+    // jeito (tabela categories); aqui o usuario entende na hora.
     const addCategory = (label: string, type: TxType) => {
+        const norm = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+        const clash = allCats.find(c => norm(c.label) === norm(label) && (c.type === type || c.type === 'ambos'));
+        if (clash) { setNotice('Você já tem a categoria "' + clash.label + '" — usei ela.'); return clash.id; }
         const id = 'c:' + slug(label);
         if (!allCats.some(c => c.id === id)) {
             setCats([...cats, { id, label, icon: '🏷️', color: PALETTE[cats.length % PALETTE.length], type }]);

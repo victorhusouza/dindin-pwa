@@ -77,6 +77,59 @@ CREATE TABLE IF NOT EXISTS invites (token_hash TEXT PRIMARY KEY, created_by INTE
 `);
 db.pragma('foreign_keys = ON');
 
+// ---------- categorias ----------
+// Nome normalizado: mesma regra do app (sem acento, minusculo, espacos aparados).
+const normLabel = (s: string) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+
+// Migracao v3: tabela de categorias com unicidade por (dono, tipo, nome normalizado).
+// ADITIVA: copia de records e nao apaga nada — os registros antigos ficam intactos
+// no banco como backup frio (rollback = voltar o codigo, sem restaurar arquivo).
+function migrateCatsIfNeeded(): void {
+    const v = db.prepare("SELECT v FROM meta WHERE k = 'schema_v'").get() as any;
+    if (v && Number(v.v) >= 3) return;
+    db.exec(`CREATE TABLE IF NOT EXISTS categories (
+        owner INTEGER NOT NULL REFERENCES users(id),
+        id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        norm_label TEXT NOT NULL,
+        icon TEXT NOT NULL DEFAULT '',
+        color TEXT NOT NULL DEFAULT '',
+        type TEXT NOT NULL DEFAULT 'ambos',
+        updated_at INTEGER NOT NULL,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (owner, id)
+    )`);
+    const rows = db.prepare("SELECT owner, id, updated_at, deleted, data FROM records WHERE entity = 'cat'").all() as any[];
+    // Etapa 0: se houver duplicata por (dono, tipo, nome) entre ATIVAS, ABORTA o boot
+    // e lista os grupos — merge so com decisao humana, nunca automatico.
+    const groups = new Map<string, string[]>();
+    for (const r of rows) {
+        if (r.deleted) continue;
+        const d = JSON.parse(r.data);
+        const key = [r.owner, d.type || 'ambos', normLabel(d.label)].join('|');
+        const g = groups.get(key) || []; g.push(r.id); groups.set(key, g);
+    }
+    const dupes = [...groups.entries()].filter(([, ids]) => ids.length > 1);
+    if (dupes.length) {
+        console.error('MIGRACAO v3 ABORTADA - categorias duplicadas por (dono|tipo|nome):');
+        for (const [k, ids] of dupes) console.error('  ' + k + ' -> ' + ids.join(', '));
+        throw new Error('migracao v3 abortada: resolver duplicatas de categorias antes');
+    }
+    const ins = db.prepare('INSERT INTO categories (owner, id, label, norm_label, icon, color, type, updated_at, deleted) VALUES (?,?,?,?,?,?,?,?,?)');
+    const txm = db.transaction((list: any[]) => {
+        for (const r of list) {
+            const d = JSON.parse(r.data);
+            ins.run(r.owner, r.id, String(d.label || r.id), normLabel(d.label), String(d.icon || ''), String(d.color || ''), String(d.type || 'ambos'), r.updated_at, r.deleted);
+        }
+    });
+    txm(rows);
+    // Indice unico parcial: so vale para categorias ativas (apagadas nao bloqueiam reutilizar o nome).
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS categories_uniq ON categories(owner, type, norm_label) WHERE deleted = 0');
+    db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_v', '3')").run();
+    console.log('migracao v3 (tabela categories: ' + rows.length + ' copiadas, registros antigos mantidos) aplicada');
+}
+migrateCatsIfNeeded();
+
 // ---------- senha (scrypt) ----------
 function hashPassword(pw: string): string {
     const salt = crypto.randomBytes(16);
@@ -230,6 +283,40 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
         for (const o of list) {
             if (!ENTITIES.has(o.entity) || typeof o.id !== 'string' || !o.id || o.id.length > 120) { results.push({ id: o?.id, status: 'invalid' }); continue; }
             const ts = Number(o.ts) > 0 ? Math.min(Number(o.ts), Date.now() + 5 * 60 * 1000) : Date.now();
+            // --- categorias vivem na tabela categories (unicidade garantida pelo banco) ---
+            if (o.entity === 'cat') {
+                const curCat = db.prepare('SELECT updated_at, deleted, label, icon, color, type FROM categories WHERE owner = ? AND id = ?').get(userId, o.id) as any;
+                if (curCat && curCat.updated_at > ts) {
+                    results.push({ id: o.id, status: 'skipped', server: curCat.deleted ? null : { id: o.id, label: curCat.label, icon: curCat.icon, color: curCat.color, type: curCat.type }, deleted: !!curCat.deleted, updated_at: curCat.updated_at });
+                    continue;
+                }
+                const catJson = (c: any) => JSON.stringify({ id: o.id, label: c.label, icon: c.icon, color: c.color, type: c.type });
+                if (o.op === 'delete') {
+                    if (curCat && !curCat.deleted) {
+                        db.prepare('UPDATE categories SET deleted = 1, updated_at = ? WHERE owner = ? AND id = ?').run(ts, userId, o.id);
+                        addHist.run(Date.now(), device, 'cat', o.id, 'delete', catJson(curCat), null, userId);
+                        applied++;
+                    }
+                    results.push({ id: o.id, status: 'applied' });
+                    continue;
+                }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                const d = o.data as any;
+                const label = String(d.label || '').trim().slice(0, 60);
+                if (!label) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                const type = d.type === 'despesa' || d.type === 'receita' ? d.type : 'ambos';
+                const norm = normLabel(label);
+                // nome repetido (mesmo dono e tipo, outro id): o banco recusaria; avisamos bonito antes
+                const clash = db.prepare('SELECT id, label FROM categories WHERE owner = ? AND type = ? AND norm_label = ? AND deleted = 0 AND id != ?').get(userId, type, norm, o.id) as any;
+                if (clash) { results.push({ id: o.id, status: 'rejected', error: 'Você já tem a categoria "' + clash.label + '".' }); continue; }
+                db.prepare(`INSERT INTO categories (owner, id, label, norm_label, icon, color, type, updated_at, deleted) VALUES (?,?,?,?,?,?,?,?,0)
+                    ON CONFLICT(owner, id) DO UPDATE SET label=excluded.label, norm_label=excluded.norm_label, icon=excluded.icon, color=excluded.color, type=excluded.type, updated_at=excluded.updated_at, deleted=0`)
+                    .run(userId, o.id, label, norm, String(d.icon || '🏷️'), String(d.color || ''), type, ts);
+                const after = JSON.stringify({ id: o.id, label, icon: String(d.icon || '🏷️'), color: String(d.color || ''), type });
+                addHist.run(Date.now(), device, 'cat', o.id, curCat && !curCat.deleted ? 'update' : 'create', curCat && !curCat.deleted ? catJson(curCat) : null, after, userId);
+                applied++; results.push({ id: o.id, status: 'applied' });
+                continue;
+            }
             const cur = getRec.get(o.entity, o.id, userId) as any;
             if (cur && cur.updated_at > ts) {
                 results.push({ id: o.id, status: 'skipped', server: cur.deleted ? null : JSON.parse(cur.data), deleted: !!cur.deleted, updated_at: cur.updated_at });
@@ -398,8 +485,11 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'GET' && p === '/api/state') {
             const out: Record<string, any[]> = {};
             for (const e of ENTITIES) out[e] = [];
-            const rows = db.prepare('SELECT entity, data FROM records WHERE deleted = 0 AND owner = ?').all(auth.userId) as any[];
+            const rows = db.prepare("SELECT entity, data FROM records WHERE deleted = 0 AND owner = ? AND entity != 'cat'").all(auth.userId) as any[];
             for (const r of rows) out[r.entity].push(JSON.parse(r.data));
+            // categorias vem da tabela (fonte da verdade), no mesmo formato de record que o app espera
+            const catRows = db.prepare('SELECT id, label, icon, color, type FROM categories WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
+            for (const c of catRows) out['cat'].push({ id: c.id, label: c.label, icon: c.icon, color: c.color, type: c.type });
             return send(res, 200, { serverTime: Date.now(), records: out });
         }
 

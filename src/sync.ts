@@ -126,7 +126,7 @@ export async function flush(): Promise<void> {
         const body = await res.json();
         const sent = new Set(ops.map(o => `${o.entity}${o.id}${o.ts}`));
         writeOutbox(readOutbox().filter(o => !sent.has(`${o.entity}${o.id}${o.ts}`)));
-        const conflicts = ((body.results || []) as { status: string }[]).filter(r => r.status === 'skipped');
+        const conflicts = ((body.results || []) as { status: string }[]).filter(r => r.status === 'skipped' || r.status === 'rejected'); // rejected: o servidor recusou (ex.: categoria com nome repetido) — o estado oficial vence
         if (conflicts.length) {
             // Outra versao mais nova venceu no servidor: puxa o estado oficial e recarrega.
             await hydrate();
