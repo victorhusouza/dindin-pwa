@@ -156,8 +156,39 @@ export async function hydrate(): Promise<void> {
     await flush();
 }
 
+// Auto-refresh Fase 1: ao voltar para o app/aba, empurra a fila local e puxa o
+// estado oficial. Se o servidor tinha algo que o aparelho nao tinha, recarrega
+// para renderizar os dados novos (mesmo padrao do conflito em flush()).
+function snapshotData(): string {
+    let s = '';
+    for (let i = 0; i < TXS_CHUNKS; i++) s += localStorage.getItem(TXS_PREFIX + i) || '';
+    for (const k of Object.keys(COLLECTIONS)) s += '|' + (localStorage.getItem(k) || '');
+    return s;
+}
+
+function formEmUso(): boolean {
+    const el = document.activeElement;
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
+let refreshing = false;
+export async function refreshFromServer(): Promise<void> {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+        await flush(); // empurra primeiro: protege o que ainda nao subiu
+        const antes = snapshotData();
+        await hydrate();
+        if (snapshotData() !== antes && !formEmUso()) window.location.reload();
+    } catch { /* offline ou erro: tenta de novo no proximo evento */ }
+    finally { refreshing = false; }
+}
+
 export function startSyncLoop(): void {
     window.addEventListener('online', () => void flush());
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) void flush(); });
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) void refreshFromServer(); });
+    window.addEventListener('focus', () => void refreshFromServer());
     setInterval(() => void flush(), 20000);
 }
