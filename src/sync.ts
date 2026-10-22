@@ -186,9 +186,36 @@ export async function refreshFromServer(): Promise<void> {
     finally { refreshing = false; }
 }
 
+
+// Auto-refresh Fase 2: com a aba visivel, pergunta a cada 30s se o servidor
+// tem algo novo (GET /api/history?limit=1, resposta minuscula: 1 registro).
+// O seq so sobe quando algo muda; se subiu, roda o ciclo completo da Fase 1
+// (empurra fila, puxa estado, recarrega so se os dados mudaram e nenhum
+// campo estiver em foco).
+const POLL_MS = 30000;
+let lastSeq: number | null = null;
+async function pollServerSeq(): Promise<void> {
+    if (document.hidden || refreshing) return;
+    try {
+        await flush(); // empurra antes: o seq lido ja reflete o que subiu daqui
+        const res = await fetch('/api/history?limit=1', { credentials: 'same-origin' });
+        if (res.status === 401) { onAuthLost?.(); return; }
+        if (!res.ok) return;
+        const body = await res.json();
+        const seq = Number(body?.entries?.[0]?.seq) || 0;
+        if (lastSeq === null) { lastSeq = seq; return; } // a abertura ja hidratou o estado
+        if (seq !== lastSeq) {
+            lastSeq = seq;
+            await refreshFromServer();
+        }
+    } catch { /* offline ou erro: proxima pergunta em 30s */ }
+}
+
 export function startSyncLoop(): void {
     window.addEventListener('online', () => void flush());
     document.addEventListener('visibilitychange', () => { if (!document.hidden) void refreshFromServer(); });
     window.addEventListener('focus', () => void refreshFromServer());
     setInterval(() => void flush(), 20000);
+    setInterval(() => void pollServerSeq(), POLL_MS);
+    void pollServerSeq(); // marca o seq atual como base (nunca recarrega)
 }
