@@ -249,6 +249,64 @@ function migrateRecsIfNeeded(): void {
 }
 migrateRecsIfNeeded();
 
+// Migracao v6: sugestoes de categoria (catrule) ganham tabela propria, no mesmo
+// ritual da v5: aditiva (copia de records, originais intactos como copia fria),
+// etapa 0 aborta o boot listando um a um registro invalido, campo desconhecido
+// ou categoria orfa. Coluna rule_key porque KEY e palavra reservada do SQLite
+// (mesmo motivo do rec_key da v4).
+const CATRULE_KEYS = new Set(['key', 'desc', 'cat', 'type', 'at']);
+function migrateCatrulesIfNeeded(): void {
+    const v = db.prepare("SELECT v FROM meta WHERE k = 'schema_v'").get() as any;
+    if (v && Number(v.v) >= 6) return;
+    db.exec(`CREATE TABLE IF NOT EXISTS catrules (
+        owner INTEGER NOT NULL REFERENCES users(id),
+        rule_key TEXT NOT NULL,
+        description TEXT NOT NULL,
+        cat TEXT NOT NULL,
+        type TEXT NOT NULL,
+        at TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (owner, rule_key),
+        FOREIGN KEY (owner, cat) REFERENCES categories(owner, id)
+    )`);
+    const rows = db.prepare("SELECT owner, id, updated_at, deleted, data FROM records WHERE entity = 'catrule'").all() as any[];
+    const catExists = db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?');
+    const problems: string[] = [];
+    for (const r of rows) {
+        let d: any = null;
+        try { d = JSON.parse(r.data); } catch { /* cai no invalido abaixo */ }
+        if (!d || typeof d !== 'object' || !validNewCatrule(d) || d.key !== r.id) {
+            problems.push('dono=' + r.owner + ' id=' + r.id + ' apagado=' + (r.deleted ? 'sim' : 'nao') + ' motivo=registro invalido (' + String(r.data).slice(0, 80) + ')');
+            continue;
+        }
+        const extra = Object.keys(d).filter(k => !CATRULE_KEYS.has(k));
+        if (extra.length) {
+            problems.push('dono=' + r.owner + ' id=' + r.id + ' motivo=campos desconhecidos: ' + extra.join(', ') + ' (a tabela nova nao teria onde guarda-los)');
+            continue;
+        }
+        if (!catExists.get(r.owner, String(d.cat))) {
+            problems.push('dono=' + r.owner + ' id=' + r.id + ' desc="' + d.desc + '" apagado=' + (r.deleted ? 'sim' : 'nao') + ' motivo=categoria orfa "' + d.cat + '"');
+        }
+    }
+    if (problems.length) {
+        console.error('MIGRACAO v6 ABORTADA - ' + problems.length + ' sugestao(oes) de categoria com problema:');
+        for (const p of problems) console.error('  ' + p);
+        throw new Error('migracao v6 abortada: resolver as sugestoes listadas acima antes');
+    }
+    const ins = db.prepare('INSERT INTO catrules (owner, rule_key, description, cat, type, at, updated_at, deleted) VALUES (?,?,?,?,?,?,?,?)');
+    const txm = db.transaction((list: any[]) => {
+        for (const r of list) {
+            const d = JSON.parse(r.data);
+            ins.run(r.owner, r.id, String(d.desc), String(d.cat), String(d.type), String(d.at), r.updated_at, r.deleted);
+        }
+    });
+    txm(rows);
+    db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_v', '6')").run();
+    console.log('migracao v6 (tabela catrules: ' + rows.length + ' copiadas, registros antigos mantidos) aplicada');
+}
+migrateCatrulesIfNeeded();
+
 // ---------- senha (scrypt) ----------
 function hashPassword(pw: string): string {
     const salt = crypto.randomBytes(16);
@@ -347,6 +405,15 @@ function validNewRec(data: any): boolean {
         && typeof data.cat === 'string' && !!data.cat
         && Number.isInteger(data.cents) && data.cents > 0
         && Number.isInteger(data.dueDay) && data.dueDay >= 1 && data.dueDay <= 31;
+}
+
+function validNewCatrule(data: any): boolean {
+    return data && typeof data === 'object' && !Array.isArray(data)
+        && typeof data.key === 'string' && !!data.key.trim()
+        && typeof data.desc === 'string' && !!data.desc.trim()
+        && typeof data.cat === 'string' && !!data.cat
+        && (data.type === 'despesa' || data.type === 'receita')
+        && typeof data.at === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.at);
 }
 
 // ---------- bloqueio por tentativas ----------
@@ -482,6 +549,40 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                     .run(userId, o.id, desc, String(d.cat), d.cents, d.dueDay, ts);
                 const after = JSON.stringify({ id: o.id, desc, cat: String(d.cat), cents: d.cents, dueDay: d.dueDay });
                 addHist.run(Date.now(), device, 'rec', o.id, curRec && !curRec.deleted ? 'update' : 'create', curRec && !curRec.deleted ? recJson(curRec) : null, after, userId);
+                applied++; results.push({ id: o.id, status: 'applied' });
+                continue;
+            }
+            // --- sugestoes de categoria vivem na tabela catrules (v6): mesmas regras ---
+            if (o.entity === 'catrule') {
+                const curRule = db.prepare('SELECT rule_key, description, cat, type, at, updated_at, deleted FROM catrules WHERE owner = ? AND rule_key = ?').get(userId, o.id) as any;
+                const ruleJson = (r: any) => JSON.stringify({ key: o.id, desc: r.description, cat: r.cat, type: r.type, at: r.at });
+                if (curRule && curRule.updated_at > ts) {
+                    results.push({ id: o.id, status: 'skipped', server: curRule.deleted ? null : JSON.parse(ruleJson(curRule)), deleted: !!curRule.deleted, updated_at: curRule.updated_at });
+                    continue; // ultima edicao vence: a do servidor e mais nova
+                }
+                if (o.op === 'delete') {
+                    if (curRule && !curRule.deleted) {
+                        db.prepare('UPDATE catrules SET deleted = 1, updated_at = ? WHERE owner = ? AND rule_key = ?').run(ts, userId, o.id);
+                        addHist.run(Date.now(), device, 'catrule', o.id, 'delete', ruleJson(curRule), null, userId);
+                        applied++;
+                    }
+                    results.push({ id: o.id, status: 'applied' });
+                    continue;
+                }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                const d = o.data as any;
+                if (d.key !== o.id || !validNewCatrule(d)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                // a categoria precisa existir (chave estrangeira): avisa bonito em vez de estourar o lote
+                if (!db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?').get(userId, String(d.cat))) {
+                    results.push({ id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
+                    continue;
+                }
+                const desc = capFirst(String(d.desc));
+                db.prepare(`INSERT INTO catrules (owner, rule_key, description, cat, type, at, updated_at, deleted) VALUES (?,?,?,?,?,?,?,0)
+                    ON CONFLICT(owner, rule_key) DO UPDATE SET description=excluded.description, cat=excluded.cat, type=excluded.type, at=excluded.at, updated_at=excluded.updated_at, deleted=0`)
+                    .run(userId, o.id, desc, String(d.cat), String(d.type), String(d.at), ts);
+                const after = JSON.stringify({ key: o.id, desc, cat: String(d.cat), type: String(d.type), at: String(d.at) });
+                addHist.run(Date.now(), device, 'catrule', o.id, curRule && !curRule.deleted ? 'update' : 'create', curRule && !curRule.deleted ? ruleJson(curRule) : null, after, userId);
                 applied++; results.push({ id: o.id, status: 'applied' });
                 continue;
             }
@@ -689,7 +790,7 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'GET' && p === '/api/state') {
             const out: Record<string, any[]> = {};
             for (const e of ENTITIES) out[e] = [];
-            const rows = db.prepare("SELECT entity, data FROM records WHERE deleted = 0 AND owner = ? AND entity NOT IN ('cat', 'tx', 'rec')").all(auth.userId) as any[];
+            const rows = db.prepare("SELECT entity, data FROM records WHERE deleted = 0 AND owner = ? AND entity NOT IN ('cat', 'tx', 'rec', 'catrule')").all(auth.userId) as any[];
             for (const r of rows) out[r.entity].push(JSON.parse(r.data));
             // categorias vem da tabela (fonte da verdade), no mesmo formato de record que o app espera
             const catRows = db.prepare('SELECT id, label, icon, color, type FROM categories WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
@@ -700,6 +801,9 @@ const server = http.createServer(async (req, res) => {
             // contas fixas vem da tabela (fonte da verdade), no mesmo formato JSON que o app espera
             const recRows = db.prepare('SELECT id, description, cat, cents, due_day FROM recs WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
             for (const r of recRows) out['rec'].push({ id: r.id, desc: r.description, cat: r.cat, cents: r.cents, dueDay: r.due_day });
+            // sugestoes de categoria vem da tabela (fonte da verdade), no mesmo formato JSON que o app espera
+            const ruleRows = db.prepare('SELECT rule_key, description, cat, type, at FROM catrules WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
+            for (const r of ruleRows) out['catrule'].push({ key: r.rule_key, desc: r.description, cat: r.cat, type: r.type, at: r.at });
             return send(res, 200, { serverTime: Date.now(), records: out });
         }
 
