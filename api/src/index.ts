@@ -192,6 +192,63 @@ function migrateTxsIfNeeded(): void {
 }
 migrateTxsIfNeeded();
 
+// Migracao v5: contas fixas ganham tabela propria (recs), no mesmo ritual da v4:
+// aditiva (copia de records, originais intactos como copia fria), etapa 0 aborta
+// o boot listando um a um registro invalido, campo desconhecido ou categoria orfa.
+// Conta fixa e sempre despesa no app, entao nao tem coluna de tipo.
+const REC_KEYS = new Set(['id', 'desc', 'cat', 'cents', 'dueDay']);
+function migrateRecsIfNeeded(): void {
+    const v = db.prepare("SELECT v FROM meta WHERE k = 'schema_v'").get() as any;
+    if (v && Number(v.v) >= 5) return;
+    db.exec(`CREATE TABLE IF NOT EXISTS recs (
+        owner INTEGER NOT NULL REFERENCES users(id),
+        id TEXT NOT NULL,
+        description TEXT NOT NULL,
+        cat TEXT NOT NULL,
+        cents INTEGER NOT NULL,
+        due_day INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (owner, id),
+        FOREIGN KEY (owner, cat) REFERENCES categories(owner, id)
+    )`);
+    const rows = db.prepare("SELECT owner, id, updated_at, deleted, data FROM records WHERE entity = 'rec'").all() as any[];
+    const catExists = db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?');
+    const problems: string[] = [];
+    for (const r of rows) {
+        let d: any = null;
+        try { d = JSON.parse(r.data); } catch { /* cai no invalido abaixo */ }
+        if (!d || typeof d !== 'object' || !validNewRec(d) || d.id !== r.id) {
+            problems.push('dono=' + r.owner + ' id=' + r.id + ' apagado=' + (r.deleted ? 'sim' : 'nao') + ' motivo=registro invalido (' + String(r.data).slice(0, 80) + ')');
+            continue;
+        }
+        const extra = Object.keys(d).filter(k => !REC_KEYS.has(k));
+        if (extra.length) {
+            problems.push('dono=' + r.owner + ' id=' + r.id + ' motivo=campos desconhecidos: ' + extra.join(', ') + ' (a tabela nova nao teria onde guarda-los)');
+            continue;
+        }
+        if (!catExists.get(r.owner, String(d.cat))) {
+            problems.push('dono=' + r.owner + ' id=' + r.id + ' desc="' + d.desc + '" apagado=' + (r.deleted ? 'sim' : 'nao') + ' motivo=categoria orfa "' + d.cat + '"');
+        }
+    }
+    if (problems.length) {
+        console.error('MIGRACAO v5 ABORTADA - ' + problems.length + ' conta(s) fixa(s) com problema:');
+        for (const p of problems) console.error('  ' + p);
+        throw new Error('migracao v5 abortada: resolver as contas fixas listadas acima antes');
+    }
+    const ins = db.prepare('INSERT INTO recs (owner, id, description, cat, cents, due_day, updated_at, deleted) VALUES (?,?,?,?,?,?,?,?)');
+    const txm = db.transaction((list: any[]) => {
+        for (const r of list) {
+            const d = JSON.parse(r.data);
+            ins.run(r.owner, r.id, String(d.desc), String(d.cat), d.cents, d.dueDay, r.updated_at, r.deleted);
+        }
+    });
+    txm(rows);
+    db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_v', '5')").run();
+    console.log('migracao v5 (tabela recs: ' + rows.length + ' copiadas, registros antigos mantidos) aplicada');
+}
+migrateRecsIfNeeded();
+
 // ---------- senha (scrypt) ----------
 function hashPassword(pw: string): string {
     const salt = crypto.randomBytes(16);
@@ -283,6 +340,15 @@ function validNewTx(data: any): boolean {
         && (data.type === 'despesa' || data.type === 'receita');
 }
 
+function validNewRec(data: any): boolean {
+    return data && typeof data === 'object' && !Array.isArray(data)
+        && typeof data.id === 'string' && !!data.id
+        && typeof data.desc === 'string' && !!data.desc.trim()
+        && typeof data.cat === 'string' && !!data.cat
+        && Number.isInteger(data.cents) && data.cents > 0
+        && Number.isInteger(data.dueDay) && data.dueDay >= 1 && data.dueDay <= 31;
+}
+
 // ---------- bloqueio por tentativas ----------
 function lockInfo(key: string): { locked: boolean; waitSec: number } {
     const row = db.prepare('SELECT n, locked_until FROM fails WHERE k = ?').get(key) as any;
@@ -342,12 +408,12 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
         ON CONFLICT(entity,id,owner) DO UPDATE SET updated_at=excluded.updated_at, deleted=excluded.deleted, data=excluded.data`);
     const addHist = db.prepare('INSERT INTO history (ts, device, entity, rid, op, before, after, owner) VALUES (?,?,?,?,?,?,?,?)');
     const tx = db.transaction((list: SyncOp[]) => {
-        // Lancamentos por ultimo: se o mesmo lote cria a categoria e o lancamento,
-        // a categoria ja existe quando o lancamento chega (chave estrangeira).
-        // A ordem entre ops da mesma entidade se mantem; o app le results por
-        // status/id (nao por posicao) e o caminho de token e so de lancamentos
-        // (ordem identica), entao reordenar aqui e seguro.
-        const ordered = [...list].sort((a, b) => (a?.entity === 'tx' ? 1 : 0) - (b?.entity === 'tx' ? 1 : 0));
+        // Categorias primeiro: lancamentos e contas fixas dependem dela (chave
+        // estrangeira), entao se o mesmo lote cria a categoria e quem a usa, a
+        // categoria ja existe. A ordem entre ops da mesma entidade se mantem; o
+        // app le results por status/id (nao por posicao) e o caminho de token e
+        // so de lancamentos (ordem identica), entao reordenar aqui e seguro.
+        const ordered = [...list].sort((a, b) => (a?.entity === 'cat' ? 0 : 1) - (b?.entity === 'cat' ? 0 : 1));
         for (const o of ordered) {
             if (!ENTITIES.has(o.entity) || typeof o.id !== 'string' || !o.id || o.id.length > 120) { results.push({ id: o?.id, status: 'invalid' }); continue; }
             const ts = Number(o.ts) > 0 ? Math.min(Number(o.ts), Date.now() + 5 * 60 * 1000) : Date.now();
@@ -382,6 +448,40 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                     .run(userId, o.id, label, norm, String(d.icon || '🏷️'), String(d.color || ''), type, ts);
                 const after = JSON.stringify({ id: o.id, label, icon: String(d.icon || '🏷️'), color: String(d.color || ''), type });
                 addHist.run(Date.now(), device, 'cat', o.id, curCat && !curCat.deleted ? 'update' : 'create', curCat && !curCat.deleted ? catJson(curCat) : null, after, userId);
+                applied++; results.push({ id: o.id, status: 'applied' });
+                continue;
+            }
+            // --- contas fixas vivem na tabela recs (v5): mesmas regras dos lancamentos ---
+            if (o.entity === 'rec') {
+                const curRec = db.prepare('SELECT description, cat, cents, due_day, updated_at, deleted FROM recs WHERE owner = ? AND id = ?').get(userId, o.id) as any;
+                const recJson = (r: any) => JSON.stringify({ id: o.id, desc: r.description, cat: r.cat, cents: r.cents, dueDay: r.due_day });
+                if (curRec && curRec.updated_at > ts) {
+                    results.push({ id: o.id, status: 'skipped', server: curRec.deleted ? null : JSON.parse(recJson(curRec)), deleted: !!curRec.deleted, updated_at: curRec.updated_at });
+                    continue; // ultima edicao vence: a do servidor e mais nova
+                }
+                if (o.op === 'delete') {
+                    if (curRec && !curRec.deleted) {
+                        db.prepare('UPDATE recs SET deleted = 1, updated_at = ? WHERE owner = ? AND id = ?').run(ts, userId, o.id);
+                        addHist.run(Date.now(), device, 'rec', o.id, 'delete', recJson(curRec), null, userId);
+                        applied++;
+                    }
+                    results.push({ id: o.id, status: 'applied' });
+                    continue;
+                }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                const d = o.data as any;
+                if (d.id !== o.id || !validNewRec(d)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                // a categoria precisa existir (chave estrangeira): avisa bonito em vez de estourar o lote
+                if (!db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?').get(userId, String(d.cat))) {
+                    results.push({ id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
+                    continue;
+                }
+                const desc = capFirst(String(d.desc));
+                db.prepare(`INSERT INTO recs (owner, id, description, cat, cents, due_day, updated_at, deleted) VALUES (?,?,?,?,?,?,?,0)
+                    ON CONFLICT(owner, id) DO UPDATE SET description=excluded.description, cat=excluded.cat, cents=excluded.cents, due_day=excluded.due_day, updated_at=excluded.updated_at, deleted=0`)
+                    .run(userId, o.id, desc, String(d.cat), d.cents, d.dueDay, ts);
+                const after = JSON.stringify({ id: o.id, desc, cat: String(d.cat), cents: d.cents, dueDay: d.dueDay });
+                addHist.run(Date.now(), device, 'rec', o.id, curRec && !curRec.deleted ? 'update' : 'create', curRec && !curRec.deleted ? recJson(curRec) : null, after, userId);
                 applied++; results.push({ id: o.id, status: 'applied' });
                 continue;
             }
@@ -434,10 +534,6 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                 applied++; results.push({ id: o.id, status: 'applied' });
             } else if (o.op === 'upsert') {
                 if (o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
-                // Descricao de conta fixa sempre com inicial maiuscula, qualquer que seja o escritor
-                // (lancamento e capitalizado no caminho proprio, acima).
-                const rec = o.data as Record<string, unknown>;
-                if (o.entity === 'rec' && typeof rec.desc === 'string') o.data = { ...rec, desc: capFirst(rec.desc) };
                 const data = JSON.stringify(o.data);
                 if (data.length > 200000) { results.push({ id: o.id, status: 'invalid' }); continue; }
                 upRec.run({ entity: o.entity, id: o.id, owner: userId, updated_at: ts, deleted: 0, data });
@@ -593,7 +689,7 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'GET' && p === '/api/state') {
             const out: Record<string, any[]> = {};
             for (const e of ENTITIES) out[e] = [];
-            const rows = db.prepare("SELECT entity, data FROM records WHERE deleted = 0 AND owner = ? AND entity NOT IN ('cat', 'tx')").all(auth.userId) as any[];
+            const rows = db.prepare("SELECT entity, data FROM records WHERE deleted = 0 AND owner = ? AND entity NOT IN ('cat', 'tx', 'rec')").all(auth.userId) as any[];
             for (const r of rows) out[r.entity].push(JSON.parse(r.data));
             // categorias vem da tabela (fonte da verdade), no mesmo formato de record que o app espera
             const catRows = db.prepare('SELECT id, label, icon, color, type FROM categories WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
@@ -601,6 +697,9 @@ const server = http.createServer(async (req, res) => {
             // lancamentos vem da tabela (fonte da verdade), no mesmo formato JSON que o app espera
             const txRows = db.prepare('SELECT id, date, description, cat, cents, type, rec_key, fitid FROM transactions WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
             for (const t of txRows) out['tx'].push({ id: t.id, date: t.date, desc: t.description, cat: t.cat, cents: t.cents, type: t.type, ...(t.rec_key ? { recKey: t.rec_key } : {}), ...(t.fitid ? { fitid: t.fitid } : {}) });
+            // contas fixas vem da tabela (fonte da verdade), no mesmo formato JSON que o app espera
+            const recRows = db.prepare('SELECT id, description, cat, cents, due_day FROM recs WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
+            for (const r of recRows) out['rec'].push({ id: r.id, desc: r.description, cat: r.cat, cents: r.cents, dueDay: r.due_day });
             return send(res, 200, { serverTime: Date.now(), records: out });
         }
 
