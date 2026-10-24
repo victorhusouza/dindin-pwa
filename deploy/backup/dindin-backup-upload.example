@@ -1,49 +1,188 @@
 #!/bin/sh
-# Envia o snapshot do dia CIFRADO (GPG, com a SUA chave publica) para Google Drive
-# (rclone) e Proton Drive (CLI oficial), depois aplica a retencao aprovada por
-# exemplo: todos os dias dos ultimos 30 dias + 1 arquivo por mes dos
-# ultimos 12 meses (dia 30; em fevereiro, o ultimo dia). Apaga o resto nas nuvens.
-# B1 (21/10/2026): sobe dindin-AAAA-MM-DD.db.gpg; .db puro na nuvem so dentro da
-# janela de 30 dias (transicao). Se a chave falhar, NAO sobe nada (nunca texto puro).
+# dindin-backup-upload v5.1 — cifra o snapshot do dia com a SUA chave publica
+# GPG (so a sua chave privada abre), envia para DUAS nuvens com confirmacao de
+# CONTEUDO e so entao remove a copia local sem cifra do dia.
+#
+# Comportamento:
+# - copia local de 14 dias passa a ser CIFRADA: o .gpg fica na pasta; o .db sem
+#   cifra do DIA so e removido apos confirmacao DUPLA (duas nuvens) do MESMO
+#   arquivo; uma terceira nuvem opcional nao participa do portao;
+# - confirmacao de upload por CONTEUDO, nao so saida/nome:
+#     B2: rclone copy ja confere SHA1 do objeto no envio + rclone check compara
+#         hash remoto com local (sem baixar);
+#     Proton Drive: activeRevision.claimedSize == tamanho local (storageSize
+#         NAO serve: inclui overhead de cifra do servico; claimedDigests.sha1
+#         pode vir com sha1Verified=false) E download do .gpg recem-enviado com
+#         sha256 identico ao local (ciphertext comparavel; NAO usa chave privada);
+# - cifragem ATOMICA (temp + rename) e REUSO VINCULADO: so reusa .gpg existente
+#   se o sidecar .meta gravado na cifragem bater com o sha256 do snapshot atual
+#   E do proprio .gpg; arquivo parseavel sozinho NAO basta;
+# - rotacao local: 14 dias mais novos com marcador .ok cujo sha256 bate com o
+#   arquivo; pendente/sem marcador/estoque antigo: intocaveis;
+# - exige o snapshot do DIA; .db sem cifra NUNCA e removido por idade.
+#
+# LIMITES HONESTOS: o vinculo .meta protege contra corrupcao acidental/reescrita
+# parcial; um invasor com escrita na VM poderia forjar sidecar e recifrar com a
+# chave publica (que e publica) — integridade contra acidente, nao contra invasor.
+#
+# Retencao nas nuvens (secao python no fim): todos os dias dos ultimos 30 dias +
+# 1 arquivo por mes dos ultimos 12 meses (dia 30; em fevereiro, o ultimo dia) +
+# paranoia: os 5 mais recentes sempre ficam. O resto e apagado automaticamente.
 set -e
 export PROTON_DRIVE_CREDENTIALS_STORE=pass
-export GNUPGHOME=/srv/dindin/.gnupg
-D=/srv/dindin/backups
-FP_ESPERADO=COLOQUE_O_FINGERPRINT_DA_SUA_CHAVE   # gpg --fingerprint <sua-chave>
+export GNUPGHOME=${GNUPGHOME:-/srv/dindin/.gnupg}
+D=${DINDIN_BACKUP_DIR:-/srv/dindin/backups}
+FP_ESPERADO=${DINDIN_BACKUP_FP:-COLOQUE_O_FINGERPRINT_DA_SUA_CHAVE}
+PUBKEY=${DINDIN_BACKUP_PUBKEY:-/usr/local/share/dindin/backup-pubkey.asc}
+HOJE=${DINDIN_HOJE:-$(date +%F)}
+OKDIR="$D/.ok"
+PD_DIR=${DINDIN_PD_DIR:-/my-files/dindin-backups}
+GD_REMOTE=${DINDIN_GD_REMOTE:-gdrive:dindin-backups}
+B2_REMOTE=${DINDIN_B2_REMOTE:-b2:dindin-backup}
+PAUSA_RETRY=${DINDIN_PAUSA_RETRY:-20}
 
-# importa a sua publica no keyring do usuario do app (idempotente)
+# importa a sua chave PUBLICA (exportada do seu computador para o servidor) no
+# keyring do usuario que roda o backup (idempotente)
 if ! gpg --batch --list-keys "$FP_ESPERADO" >/dev/null 2>&1; then
-# importa a sua chave PUBLICA (exportada do seu computador para o servidor)
-gpg --batch --import /usr/local/share/dindin/backup-pubkey.asc || { echo "GPG_IMPORT_FALHOU"; exit 1; }
+gpg --batch --import "$PUBKEY" || { echo "GPG_IMPORT_FALHOU"; exit 1; }
 fi
 
 # confere o fingerprint antes de cifrar: nunca cifra pra chave errada
 FP_REAL=$(gpg --batch --with-colons --fingerprint "$FP_ESPERADO" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
 [ "$FP_REAL" = "$FP_ESPERADO" ] || { echo "GPG_FINGERPRINT_FALHOU esperado=$FP_ESPERADO obtido=$FP_REAL"; exit 1; }
 
-LATEST=$(ls -1t $D/dindin-*.db | head -1)
-[ -n "$LATEST" ] || exit 1
+# exige o snapshot do DIA (protege estoque antigo: sem ele, nada acontece)
+LATEST="$D/dindin-$HOJE.db"
+{ [ -f "$LATEST" ] && [ ! -L "$LATEST" ]; } || { echo "SNAPSHOT_DE_HOJE_AUSENTE dia=$HOJE"; exit 1; }
 ENC="$LATEST.gpg"
-gpg --batch --yes --trust-model always --recipient "$FP_ESPERADO" --output "$ENC" --encrypt "$LATEST" || { echo "GPG_FALHOU"; exit 1; }
-chmod 600 "$ENC" 2>/dev/null || true
+META="$ENC.meta"
+HASH_LOCAL=""
 
+gpg_valido() { [ -s "$1" ] && gpg --batch --list-only "$1" >/dev/null 2>&1; }
+meta_confere() {
+  [ -f "$META" ] || return 1
+  MS=$(awk -F= '$1=="src_sha256"{print $2}' "$META")
+  MG=$(awk -F= '$1=="gpg_sha256"{print $2}' "$META")
+  [ -n "$MS" ] && [ -n "$MG" ] || return 1
+  [ "$MS" = "$(sha256sum "$LATEST" | awk '{print $1}')" ] || return 1
+  [ "$MG" = "$(sha256sum "$ENC" | awk '{print $1}')" ]
+}
+
+# reuso vinculado OU cifragem atomica
+if gpg_valido "$ENC" && meta_confere; then
+  echo "GPG_REUSADO $HOJE (vinculado ao snapshot pelo .meta)"
+else
+  [ -e "$ENC" ] && echo "GPG_REJEITADO $HOJE (sem vinculo com o snapshot atual; recifrando)"
+  TMP="$ENC.tmp.$$"
+  rm -f "$TMP"
+  if gpg --batch --yes --trust-model always --recipient "$FP_ESPERADO" --output "$TMP" --encrypt "$LATEST" \
+     && [ -s "$TMP" ] && gpg --batch --list-only "$TMP" >/dev/null 2>&1; then
+    chmod 600 "$TMP" 2>/dev/null || true
+    mv -f "$TMP" "$ENC"
+    printf 'src_sha256=%s\ngpg_sha256=%s\n' \
+      "$(sha256sum "$LATEST" | awk '{print $1}')" \
+      "$(sha256sum "$ENC" | awk '{print $1}')" > "$META"
+    chmod 600 "$META" 2>/dev/null || true
+    echo "GPG_CIFRADO $HOJE"
+  else
+    rm -f "$TMP"
+    echo "GPG_FALHOU"
+    exit 1
+  fi
+fi
+
+TAM_LOCAL=$(wc -c < "$ENC" | tr -d ' ')
+HASH_LOCAL=$(sha256sum "$ENC" | awk '{print $1}')
+NOME=$(basename "$ENC")
+
+# 1 tentativa Proton = upload + tamanho remoto == local + download com sha256 igual
+sobe_proton() {
+  proton-drive filesystem upload -f create-new-revision "$ENC" "$PD_DIR" >/dev/null 2>&1 || { PD_MOTIVO=upload; return 1; }
+  TAM_REMOTO=$(proton-drive filesystem info --json "$PD_DIR/$NOME" 2>/dev/null | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin); v=d.get("activeRevision",{}).get("claimedSize","")
+  print(v if isinstance(v,int) else "")
+except Exception: print("")')
+  { [ -n "$TAM_REMOTO" ] && [ "$TAM_REMOTO" = "$TAM_LOCAL" ]; } || { PD_MOTIVO=verificacao-tamanho; return 1; }
+  DLTEMP=$(mktemp -d) || { PD_MOTIVO=verificacao-download; return 1; }
+  proton-drive filesystem download "$PD_DIR/$NOME" "$DLTEMP" >/dev/null 2>&1 || { rm -rf "$DLTEMP"; PD_MOTIVO=verificacao-download; return 1; }
+  if [ -f "$DLTEMP/$NOME" ] && [ "$(sha256sum "$DLTEMP/$NOME" | awk '{print $1}')" = "$HASH_LOCAL" ]; then
+    rm -rf "$DLTEMP"; return 0
+  fi
+  rm -rf "$DLTEMP"; PD_MOTIVO=verificacao-hash; return 1
+}
+# 1 tentativa B2 = rclone copy (SHA1 conferido no envio) + rclone check (hash remoto)
+sobe_b2() {
+  rclone copy "$ENC" "$B2_REMOTE" >/dev/null 2>&1 || { B2_MOTIVO=upload; return 1; }
+  rclone check --one-way --include "$NOME" "$D" "$B2_REMOTE" >/dev/null 2>&1 && return 0
+  B2_MOTIVO=verificacao; return 1
+}
+
+PD_OK=0; PD_MOTIVO=
+i=1; while [ $i -le 2 ]; do
+  sobe_proton && { PD_OK=1; break; }
+  echo "PROTON_TENTATIVA_${i}_FALHOU motivo=$PD_MOTIVO"
+  i=$((i+1)); [ $i -le 2 ] && sleep "$PAUSA_RETRY"
+done
+[ "$PD_OK" = 1 ] || echo "PROTON_FALHOU motivo=$PD_MOTIVO"
+
+B2_OK=0; B2_MOTIVO=
+i=1; while [ $i -le 2 ]; do
+  sobe_b2 && { B2_OK=1; break; }
+  echo "B2_TENTATIVA_${i}_FALHOU motivo=$B2_MOTIVO"
+  i=$((i+1)); [ $i -le 2 ] && sleep "$PAUSA_RETRY"
+done
+[ "$B2_OK" = 1 ] || echo "B2_FALHOU motivo=$B2_MOTIVO"
+
+# terceira nuvem OPCIONAL: falha so registra no log, nao participa do portao
 GD_OK=1
-rclone copy "$ENC" gdrive:dindin-backups || { echo "GDRIVE_FALHOU"; GD_OK=0; }
-PD_OK=1
-proton-drive filesystem upload "$ENC" /my-files/dindin-backups || { echo "PROTON_FALHOU"; PD_OK=0; }
-if [ "$GD_OK" = 1 ] && [ "$PD_OK" = 1 ]; then rm -f "$ENC"; fi
+rclone copy "$ENC" "$GD_REMOTE" >/dev/null 2>&1 || { echo "GDRIVE_FALHOU"; GD_OK=0; }
+
+# portao: as DUAS nuvens principais confirmadas para ESTE arquivo -> marcador +
+# remove APENAS o .db do dia; sem portao, .db e .gpg ficam locais sem limite
+if [ "$PD_OK" = 1 ] && [ "$B2_OK" = 1 ]; then
+  mkdir -p "$OKDIR"
+  printf 'sha256 %s\ntamanho %s\n' "$HASH_LOCAL" "$TAM_LOCAL" > "$OKDIR/dindin-$HOJE.ok"
+  chmod 600 "$OKDIR/dindin-$HOJE.ok" 2>/dev/null || true
+  rm -f "$LATEST" || true
+  if [ -e "$LATEST" ]; then
+    echo "FALHA_AO_APAGAR $LATEST"
+  else
+    echo "LOCAL APAGAR dindin-$HOJE.db (dupla confirmacao ok; .gpg local mantido)"
+  fi
+else
+  echo "LOCAL MANTER dindin-$HOJE.db (sem dupla confirmacao; .db e .gpg ficam)"
+fi
 
 chmod 600 $D/dindin-*.db 2>/dev/null || true
-chmod 600 /srv/dindin/data/dindin.db* 2>/dev/null || true
+chmod 600 $D/dindin-*.db.gpg $D/dindin-*.db.gpg.meta 2>/dev/null || true
 
-python3 - <<'PYEOF' || echo "RETENCAO_FALHOU"
+# rotacao local: mantem os 14 dias MAIS NOVOS com marcador cujo sha256 bate com
+# o arquivo; qualquer coisa sem marcador valido (pendente, estoque antigo) fica
+DIAS_CONF=$(mktemp)
+ls -1 $D/dindin-????-??-??.db.gpg 2>/dev/null | while read -r f; do
+  b=$(basename "$f" .db.gpg)
+  M="$OKDIR/$b.ok"
+  [ -f "$M" ] || continue
+  HM=$(awk '$1=="sha256"{print $2}' "$M")
+  HA=$(sha256sum "$f" | awk '{print $1}')
+  [ -n "$HM" ] && [ "$HM" = "$HA" ] && echo "$b"
+done | sort -r > "$DIAS_CONF"
+tail -n +15 "$DIAS_CONF" | while read -r b; do
+  rm -f "$D/$b.db.gpg" "$D/$b.db.gpg.meta" "$OKDIR/$b.ok"
+  echo "LOCAL ROTACAO APAGAR $b.db.gpg (fora dos 14 confirmados mais novos)"
+done
+rm -f "$DIAS_CONF"
+
+DINDIN_PD_DIR="$PD_DIR" DINDIN_GD_REMOTE="$GD_REMOTE" DINDIN_B2_REMOTE="$B2_REMOTE" python3 - <<'PYEOF' || echo "RETENCAO_FALHOU"
 import calendar, datetime, json, os, subprocess, sys
 
-GD_REMOTE = 'gdrive:dindin-backups'
-PD_PATH = '/my-files/dindin-backups'
+GD_REMOTE = os.environ.get('DINDIN_GD_REMOTE', 'gdrive:dindin-backups')
+B2_REMOTE = os.environ.get('DINDIN_B2_REMOTE', 'b2:dindin-backup')
+PD_PATH = os.environ.get('DINDIN_PD_DIR', '/my-files/dindin-backups')
 
-def list_gdrive():
-    out = subprocess.run(['rclone', 'lsf', GD_REMOTE, '--files-only'], capture_output=True, text=True)
+def list_rclone(remote):
+    out = subprocess.run(['rclone', 'lsf', remote, '--files-only'], capture_output=True, text=True)
     return [l.strip() for l in out.stdout.splitlines() if l.strip().startswith('dindin-')]
 
 def list_proton():
@@ -91,7 +230,7 @@ def keep_set(names, today):
     keep = set()
     for n, d, kind in entries:
         if d not in keep_dates: continue
-        # transicao: .db puro (pre-B1) so fica dentro da janela de 30 dias
+        # transicao: .db puro (pre-cifra) so fica dentro da janela de 30 dias
         if kind == 'db' and datetime.date.fromisoformat(d) < cutoff: continue
         keep.add(n)
     return keep
@@ -104,8 +243,11 @@ def run():
         names = [l.strip() for l in open(lf) if l.strip()]
         clouds = [('TESTE', names, None)]
     else:
-        clouds = [('GDRIVE', list_gdrive(), lambda n: ['rclone', 'deletefile', '%s/%s' % (GD_REMOTE, n)]),
-                  ('PROTON', list_proton(), lambda n: ['proton-drive', 'filesystem', 'trash', '%s/%s' % (PD_PATH, n)])]
+        clouds = [('GDRIVE', list_rclone(GD_REMOTE),
+                   lambda n: ['rclone', 'deletefile', '%s/%s' % (GD_REMOTE, n)]),
+                  ('B2', list_rclone(B2_REMOTE),
+                   lambda n: ['rclone', 'deletefile', '--b2-hard-delete', '%s/%s' % (B2_REMOTE, n)])]
+        clouds.append(('PROTON', list_proton(), lambda n: ['proton-drive', 'filesystem', 'trash', '%s/%s' % (PD_PATH, n)]))
     rc = 0
     for label, names, delcmd in clouds:
         keep = keep_set(names, today)

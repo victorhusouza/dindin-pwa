@@ -1,7 +1,12 @@
 #!/bin/sh
-# Snapshot diario do banco (roda como o usuario do app, ex.: dindinapp, via cron).
-# Guarda copias locais dos ultimos 30 dias; o envio cifrado fica no dindin-backup-upload.
+# dindin-snapshot v2 — snapshot diario do banco SQLite (roda como o usuario do
+# app, ex.: dindinapp, via cron). SEM poda por idade de .db: quem remove o .db
+# sem cifra e o dindin-backup-upload, somente o do dia e somente apos dupla
+# confirmacao de envio (duas nuvens). Backup pendente nunca e apagado por
+# ficar antigo.
 set -e
-D=/srv/dindin/backups
-sqlite3 /srv/dindin/data/dindin.db ".backup '$D/dindin-$(date +%F).db'"
-ls -1t $D/dindin-*.db | tail -n +31 | xargs -r rm --
+D=${DINDIN_BACKUP_DIR:-/srv/dindin/backups}
+DB=${DINDIN_DATA_DB:-/srv/dindin/data/dindin.db}
+HOJE=${DINDIN_HOJE:-$(date +%F)}
+sqlite3 "$DB" ".backup '$D/dindin-$HOJE.db'"
+chmod 600 "$D/dindin-$HOJE.db" 2>/dev/null || true
