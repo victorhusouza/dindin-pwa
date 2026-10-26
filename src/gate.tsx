@@ -1,7 +1,9 @@
 // Porta de entrada do app: setup da senha (primeiro uso), login, hidratacao
 // do estado vindo da VM e, logado, o app + botoes de Historico e Sair.
 import React, { useCallback, useEffect, useState } from 'react';
-import { hydrate, startSyncLoop, setAuthLostHandler, deviceLabel } from './sync';
+import { hydrate, startSyncLoop, setAuthLostHandler, setSyncUser, deviceLabel, getSyncUser, authLostConta } from './sync';
+import { v2Boot } from './idb/v2store';
+import { v2MotorStart } from './idb/motor';
 
 type Stage = 'loading' | 'setup' | 'login' | 'register' | 'hydrating' | 'ready';
 
@@ -21,7 +23,11 @@ export function HistoryModal({ onClose, device }: { onClose: () => void; device?
     useEffect(() => {
         fetch('/api/history?limit=100' + (device ? '&device=' + encodeURIComponent(device) : ''), { credentials: 'same-origin' })
             .then(r => { if (!r.ok) throw new Error(); return r.json(); })
-            .then(b => setEntries(b.entries || []))
+            .then(b => {
+                // identidade tambem no historico: resposta de outra conta derruba a aba
+                if (b.username && String(b.username).trim().toLowerCase() !== getSyncUser()) { authLostConta(); return; }
+                setEntries(b.entries || []);
+            })
             .catch(() => setErr('Não consegui carregar o histórico agora.'));
     }, [device]);
     return <div style={overlayStyle} onClick={onClose}>
@@ -59,12 +65,26 @@ export function Gate({ children }: { children: React.ReactNode }) {
 
     const afterAuth = useCallback(async () => {
         setStage('hydrating');
-        try { await hydrate(); startSyncLoop(); setStage('ready'); }
-        catch { setErr('Sem conexão com o servidor. Tente de novo.'); setStage('login'); }
+        try {
+            // A fila de sync e por conta: registra o usuario ANTES de hidratar
+            // (a hidratacao ja empurra a fila da conta certa).
+            const st = await fetch('/api/auth/status', { credentials: 'same-origin' }).then(r => r.json()).catch(() => null);
+            setSyncUser(st && st.username ? String(st.username) : null);
+            // Caminho v2 EXPERIMENTAL (ensaio): so ativa se a flag do fixture
+            // existir; NUNCA roda hydrate/poll/flush v1 nesse modo. Sem flag:
+            // v1 exatamente como hoje.
+            if (st && st.username && await v2Boot(String(st.username).trim().toLowerCase())) { await v2MotorStart(String(st.username).trim().toLowerCase()); setStage('ready'); return; }
+            await hydrate(); startSyncLoop(); setStage('ready');
+        }
+        catch (e) {
+            // conta divergente ja cuidou da saida com a mensagem certa: nao sobrescrever
+            if (e instanceof Error && e.message === 'conta trocada') return;
+            setErr('Sem conexão com o servidor. Tente de novo.'); setStage('login');
+        }
     }, []);
 
     useEffect(() => {
-        setAuthLostHandler(() => setStage('login'));
+        setAuthLostHandler((reason?: string) => { setSyncUser(null); if (reason) setErr(reason); setStage('login'); });
         // Convite chega no fragmento (#convite=...): nao vai para logs nem para o servidor na URL.
         const m = /#convite=([A-Za-z0-9_-]+)/.exec(window.location.hash);
         if (m) { setInvite(m[1]); setStage('register'); return; }
@@ -93,7 +113,7 @@ export function Gate({ children }: { children: React.ReactNode }) {
 
     if (stage === 'ready') return <>
         {children}
-        <div style={{ position: 'fixed', left: 10, bottom: 10, zIndex: 900, display: 'flex', gap: 8 }}>
+        <div className="gatedock" style={{ position: 'fixed', left: 10, bottom: 10, zIndex: 900, display: 'flex', gap: 8 }}>
             <button onClick={() => setShowHistory(true)} title="Histórico de alterações" style={fabStyle}>🕘</button>
             <button onClick={() => void logout()} title="Sair" style={fabStyle}>⏻</button>
         </div>

@@ -68,13 +68,14 @@ migrateIfNeeded();
 db.exec(`
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, pass_hash TEXT NOT NULL, created_at INTEGER NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, public_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS records (entity TEXT NOT NULL, id TEXT NOT NULL, owner INTEGER NOT NULL REFERENCES users(id), updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL, PRIMARY KEY (entity, id, owner));
 CREATE INDEX IF NOT EXISTS idx_records_owner ON records(owner, entity);
 CREATE TABLE IF NOT EXISTS history (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '', entity TEXT NOT NULL, rid TEXT NOT NULL, op TEXT NOT NULL, before TEXT, after TEXT, owner INTEGER NOT NULL REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS fails (k TEXT PRIMARY KEY, n INTEGER NOT NULL, locked_until INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS service_tokens (token_hash TEXT PRIMARY KEY, label TEXT NOT NULL, scopes TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER, last_used_at INTEGER, user_id INTEGER NOT NULL REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS invites (token_hash TEXT PRIMARY KEY, created_by INTEGER NOT NULL REFERENCES users(id), created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);
+CREATE TABLE IF NOT EXISTS dedupe (owner INTEGER NOT NULL, op_id TEXT NOT NULL, payload_hash TEXT NOT NULL, resultado_json TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (owner, op_id));
 `);
 db.pragma('foreign_keys = ON');
 
@@ -307,6 +308,50 @@ function migrateCatrulesIfNeeded(): void {
 }
 migrateCatrulesIfNeeded();
 
+// Migracao v7: sessoes ganham public_id — identificador publico aleatorio, NAO
+// derivado do token, para a tela "Aparelhos conectados" referenciar qual sessao
+// encerrar sem expor nenhuma parte do segredo. ADITIVA: so acrescenta a coluna
+// e sorteia ids para as sessoes que ja existem; nada e apagado.
+function migrateSessionIdsIfNeeded(): void {
+    const v = db.prepare("SELECT v FROM meta WHERE k = 'schema_v'").get() as any;
+    if (!v || Number(v.v) < 7) {
+        const cols = db.prepare('PRAGMA table_info(sessions)').all() as any[];
+        if (!cols.some(c => c.name === 'public_id')) {
+            db.exec("ALTER TABLE sessions ADD COLUMN public_id TEXT NOT NULL DEFAULT ''");
+        }
+    // Parcial: sessoes gravadas por codigo antigo (rollback) ficam com '' e NAO
+    // colidem entre si; so ids preenchidos precisam ser unicos.
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS sessions_public_id_uniq ON sessions(public_id) WHERE public_id <> ''");
+        db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_v', '7')").run();
+        console.log('migracao v7 (sessions.public_id) aplicada');
+    }
+    // Fora do portao de versao, de proposito: sessao gravada por codigo ANTIGO
+    // durante um rollback (public_id = '') recebe um id em qualquer subida do
+    // codigo novo. UPDATE barato e vazio no caminho normal.
+    db.prepare("UPDATE sessions SET public_id = lower(hex(randomblob(16))) WHERE public_id = ''").run();
+}
+migrateSessionIdsIfNeeded();
+
+// Migracao v8: cada registro ganha uma versao numerada pelo SERVIDOR (inteiro,
+// +1 a cada escrita aplicada), em todas as tabelas, tombstones incluidos.
+// ADITIVA: so acrescenta a coluna valendo 1 para o que ja existe; nada e
+// apagado nem reordenado. Base da protecao contra gravacoes de telas
+// desatualizadas (a comparacao em si entra em etapa propria).
+function migrateRecordVersionsIfNeeded(): void {
+    const v = db.prepare("SELECT v FROM meta WHERE k = 'schema_v'").get() as any;
+    if (!v || Number(v.v) < 8) {
+        for (const t of ['records', 'categories', 'transactions', 'recs', 'catrules']) {
+            const cols = db.prepare(`PRAGMA table_info(${t})`).all() as any[];
+            if (!cols.some(c => c.name === 'version')) {
+                db.exec(`ALTER TABLE ${t} ADD COLUMN version INTEGER NOT NULL DEFAULT 1`);
+            }
+        }
+        db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_v', '8')").run();
+        console.log('migracao v8 (version por registro) aplicada');
+    }
+}
+migrateRecordVersionsIfNeeded();
+
 // ---------- senha (scrypt) ----------
 function hashPassword(pw: string): string {
     const salt = crypto.randomBytes(16);
@@ -342,12 +387,50 @@ function passwordIssues(pw: unknown): string | null {
 
 // ---------- sessoes ----------
 const sha256 = (s: string) => crypto.createHash('sha256').update(s).digest('hex');
-function createSession(device: string, userId: number): { token: string; expires: number } {
+// Rotulo curto e legivel derivado do User-Agent (navegador + sistema).
+// Ressalva: nao identifica o aparelho exato — dois celulares com o mesmo
+// navegador aparecem iguais; a data de entrada e o que os distingue na lista.
+function uaLabel(ua: string): string {
+    const s = String(ua || '');
+    let os = '';
+    if (/iPhone/.test(s)) os = 'iPhone';
+    else if (/iPad/.test(s)) os = 'iPad';
+    else if (/Android/.test(s)) os = 'Android';
+    else if (/Windows/.test(s)) os = 'Windows';
+    else if (/Mac OS X/.test(s)) os = 'Mac';
+    else if (/Linux/.test(s)) os = 'Linux';
+    let br = '';
+    if (/Edg\//.test(s)) br = 'Edge';
+    else if (/Firefox\//.test(s)) br = 'Firefox';
+    else if (/Chrome\//.test(s)) br = 'Chrome';
+    else if (/Safari\//.test(s)) br = 'Safari';
+    if (br && os) return br + ' no ' + os;
+    if (br) return br;
+    if (os) return 'Navegador no ' + os;
+    return 'Navegador não identificado';
+}
+
+function createSession(device: string, userId: number, ua: string): { token: string; expires: number } {
     const token = crypto.randomBytes(32).toString('base64url');
     const now = Date.now();
-    db.prepare('INSERT INTO sessions (token_hash, created_at, expires_at, device, user_id) VALUES (?,?,?,?,?)')
-        .run(sha256(token), now, now + SESSION_TTL_MS, device.slice(0, 80), userId);
-    return { token, expires: now + SESSION_TTL_MS };
+    // Precedencia do rotulo: User-Agent ("Safari no iPhone") quando identificado;
+    // senao o rotulo simples que o app envia ("iPhone", "Computador"); senao fica
+    // explicito que nao deu pra identificar. O app tambem manda o rotulo dele no
+    // corpo do sync (para o historico) — isso nao muda.
+    const fromUa = uaLabel(ua);
+    const label = (fromUa !== 'Navegador não identificado' ? fromUa : (device || fromUa)).slice(0, 80);
+    const ins = db.prepare('INSERT INTO sessions (token_hash, public_id, created_at, expires_at, device, user_id) VALUES (?,?,?,?,?,?)');
+    // public_id aleatorio (128 bits): sem relacao com o token; na colisao
+    // improvavel, sorteia outro — depois disso desiste e sobe o erro.
+    for (let i = 0; i < 3; i++) {
+        try {
+            ins.run(sha256(token), crypto.randomBytes(16).toString('hex'), now, now + SESSION_TTL_MS, label, userId);
+            return { token, expires: now + SESSION_TTL_MS };
+        } catch (e: any) {
+            if (i === 2 || !String(e?.message || '').includes('UNIQUE')) throw e;
+        }
+    }
+    throw new Error('nao foi possivel criar a sessao');
 }
 function sessionFromCookie(req: http.IncomingMessage): { token: string; device: string; userId: number; username: string; isAdmin: boolean } | null {
     const raw = req.headers.cookie || '';
@@ -466,14 +549,56 @@ const hasUser = () => !!db.prepare('SELECT 1 FROM users LIMIT 1').get();
 const clientIp = (req: http.IncomingMessage) => (req.headers['x-forwarded-for'] as string || '').split(',')[0].trim() || req.socket.remoteAddress || '?';
 
 // ---------- sync ----------
-interface SyncOp { entity: string; id: string; op: string; data?: unknown; ts?: number; }
-function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: number; results: any[] } {
+interface SyncOp { entity: string; id: string; op: string; data?: unknown; ts?: number; base_v?: number | null; op_id?: string; sucessor_of?: string }
+// Dedupe (spec 3): replay read-only por (owner, op_id) — mesmo op_id com
+// payload identico devolve o resultado gravado SEM reaplicar; payload
+// diferente e 'invalid' (reuso de op_id e bug/abuso). SEM limpeza automatica
+// nesta fase (spec 5): retry tardio de cliente offline nao tem prazo maximo.
+const canonPayload = (o: SyncOp): string => JSON.stringify({ entity: o.entity, id: o.id, op: o.op, data: o.data ?? null, base_v: o.base_v ?? null, sucessor_of: o.sucessor_of ?? null });
+const hashPayload = (o: SyncOp): string => sha256(canonPayload(o));
+function applyOps(device: string, userId: number, ops: SyncOp[], casMode: boolean): { applied: number; results: any[] } {
     const results: any[] = [];
     let applied = 0;
-    const getRec = db.prepare('SELECT updated_at, deleted, data FROM records WHERE entity = ? AND id = ? AND owner = ?');
-    const upRec = db.prepare(`INSERT INTO records (entity, id, owner, updated_at, deleted, data) VALUES (@entity,@id,@owner,@updated_at,@deleted,@data)
-        ON CONFLICT(entity,id,owner) DO UPDATE SET updated_at=excluded.updated_at, deleted=excluded.deleted, data=excluded.data`);
+    const getRec = db.prepare('SELECT updated_at, deleted, data, version FROM records WHERE entity = ? AND id = ? AND owner = ?');
+    const upRec = db.prepare(`INSERT INTO records (entity, id, owner, updated_at, deleted, data, version) VALUES (@entity,@id,@owner,@updated_at,@deleted,@data,@version)
+        ON CONFLICT(entity,id,owner) DO UPDATE SET updated_at=excluded.updated_at, deleted=excluded.deleted, data=excluded.data, version=excluded.version`);
     const addHist = db.prepare('INSERT INTO history (ts, device, entity, rid, op, before, after, owner) VALUES (?,?,?,?,?,?,?,?)');
+    // Dedupe (spec 3): replay read-only na MESMA transacao do lote. op_id com
+    // payload identico -> resultado gravado, SEM reaplicar nem regravar; payload
+    // diferente -> 'invalid' (reuso de op_id e bug/abuso). Sem limpeza automatica.
+    const getDedupe = db.prepare('SELECT payload_hash, resultado_json FROM dedupe WHERE owner = ? AND op_id = ?');
+    // Identidade (owner, op_id, payload_hash) gravada UMA vez, na primeira
+    // vez que a op chega — INSERT OR IGNORE nunca sobrescreve o hash, entao
+    // reuso com payload diferente e SEMPRE 'invalid', para sempre.
+    const insDedupeId = db.prepare("INSERT OR IGNORE INTO dedupe (owner, op_id, payload_hash, resultado_json, ts) VALUES (?,?,?,'',?)");
+    // Resultado TERMINAL (applied/skipped/stale/invalid estrutural) memoizado
+    // na MESMA linha, atomico e so uma vez (WHERE resultado_json=''): o hash
+    // nunca e tocado e um resultado terminal gravado nunca e substituido.
+    const memoDedupe = db.prepare("UPDATE dedupe SET resultado_json = ?, ts = ? WHERE owner = ? AND op_id = ? AND resultado_json = ''");
+    const TERMINAL = new Set(['applied', 'skipped', 'stale', 'invalid']);
+    const pushRes = (o: SyncOp, r: any, memo = true): void => {
+        if (o && typeof o.op_id === 'string' && o.op_id) r.op_id = o.op_id; // eco: o cliente correlaciona por op_id antes da tripla
+        results.push(r);
+        // 'rejected' depende de ESTADO do servidor (categoria ausente, rotulo
+        // em conflito): NAO memoiza — o retry reavalia quando a condicao muda.
+        // memo=false: mismatch de payload nao grava nada (nem resultado, nem hash).
+        if (memo && TERMINAL.has(String(r && r.status)) && o && typeof o.op_id === 'string' && o.op_id && o.op_id.length <= 80) memoDedupe.run(JSON.stringify(r), Date.now(), userId, o.op_id);
+    };
+    // Adocao de base por VINCULO (spec 4d): so quando ha sucessor_of explicito E
+    // a antecessora consta aplicada na dedupe com a versao que e EXATAMENTE a
+    // corrente — a aba aprendeu a base do resultado da propria intencao anterior.
+    // Igualdade de base sozinha NAO prova linhagem; sem as duas provas, stale.
+    const adotaBase = (o: SyncOp, curVersion: number): number | null => {
+        const base = typeof o.base_v === 'number' ? o.base_v : null;
+        if (base === curVersion || !o.sucessor_of) return base;
+        const d = getDedupe.get(userId, String(o.sucessor_of)) as any;
+        if (!d || !d.resultado_json) return base;
+        // A antecessora tem que ser aplicada, do MESMO dono (chave da dedupe),
+        // do MESMO entity+id e na versao EXATAMENTE corrente — owner+applied+
+        // versao sem entity+id deixaria uma op do item X adotar base de Y.
+        try { const r = JSON.parse(d.resultado_json); if (r && r.status === 'applied' && r.entity === o.entity && r.id === o.id && typeof r.version === 'number' && r.version === curVersion) return curVersion; } catch { /* ignora */ }
+        return base;
+    };
     const tx = db.transaction((list: SyncOp[]) => {
         // Categorias primeiro: lancamentos e contas fixas dependem dela (chave
         // estrangeira), entao se o mesmo lote cria a categoria e quem a usa, a
@@ -482,166 +607,274 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
         // so de lancamentos (ordem identica), entao reordenar aqui e seguro.
         const ordered = [...list].sort((a, b) => (a?.entity === 'cat' ? 0 : 1) - (b?.entity === 'cat' ? 0 : 1));
         for (const o of ordered) {
-            if (!ENTITIES.has(o.entity) || typeof o.id !== 'string' || !o.id || o.id.length > 120) { results.push({ id: o?.id, status: 'invalid' }); continue; }
+            if (!ENTITIES.has(o.entity) || typeof o.id !== 'string' || !o.id || o.id.length > 120) { results.push({ entity: o?.entity, id: o?.id, ts: o?.ts, status: 'invalid' }); continue; }
+            if (typeof o.op_id === 'string' && o.op_id) {
+                const d = getDedupe.get(userId, o.op_id) as any;
+                if (d) {
+                    if (d.payload_hash !== hashPayload(o)) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid', error: 'op_id reutilizado com conteúdo diferente' }, false); continue; }
+                    if (d.resultado_json) { try { results.push(JSON.parse(d.resultado_json)); } catch { results.push({ entity: o.entity, id: o.id, ts: o.ts, status: 'invalid', error: 'dedupe corrompida' }); } continue; }
+                    // hash igual, resultado vazio: a tentativa anterior terminou em
+                    // rejeicao dependente de estado — REAVALIA contra o estado atual.
+                } else if (o.op_id.length <= 80) insDedupeId.run(userId, o.op_id, hashPayload(o), Date.now());
+            }
             const ts = Number(o.ts) > 0 ? Math.min(Number(o.ts), Date.now() + 5 * 60 * 1000) : Date.now();
             // --- categorias vivem na tabela categories (unicidade garantida pelo banco) ---
             if (o.entity === 'cat') {
-                const curCat = db.prepare('SELECT updated_at, deleted, label, icon, color, type FROM categories WHERE owner = ? AND id = ?').get(userId, o.id) as any;
-                if (curCat && curCat.updated_at > ts) {
-                    results.push({ id: o.id, status: 'skipped', server: curCat.deleted ? null : { id: o.id, label: curCat.label, icon: curCat.icon, color: curCat.color, type: curCat.type }, deleted: !!curCat.deleted, updated_at: curCat.updated_at });
+                const curCat = db.prepare('SELECT updated_at, deleted, label, icon, color, type, version FROM categories WHERE owner = ? AND id = ?').get(userId, o.id) as any;
+                const nv = (curCat ? curCat.version : 0) + 1; // proxima versao, se esta op aplicar
+                                if (casMode) {
+                                    // CAS (ramo sessao): a op so aplica sobre a versao que a aba viu.
+                                    // base_v null = create de id novo; divergencia = 'stale' com versao
+                                    // e conteudo oficiais — a tentativa vira conflito recuperavel no
+                                    // cliente. ts de cliente nao decide mais nada neste ramo.
+                                    const base = adotaBase(o, curCat ? curCat.version : 0);
+                                    if (!curCat) {
+                                        if (base !== null) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: 0, server: null, deleted: false }); continue; }
+                                    } else if (curCat.deleted) {
+                                        // delete de ja-deletado: noop-applied SO com base == version do
+                                        // tombstone; upsert sobre tombstone: SEMPRE stale.
+                                        if (o.op === 'delete' && base === curCat.version) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied' }); continue; }
+                                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: curCat.version, server: null, deleted: true, updated_at: curCat.updated_at }); continue;
+                                    } else if (base !== curCat.version) {
+                                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: curCat.version, server: { id: o.id, label: curCat.label, icon: curCat.icon, color: curCat.color, type: curCat.type }, deleted: false, updated_at: curCat.updated_at }); continue;
+                                    }
+                                } else if (curCat && curCat.updated_at > ts) {
+                    pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'skipped', version: curCat.version, server: curCat.deleted ? null : { id: o.id, label: curCat.label, icon: curCat.icon, color: curCat.color, type: curCat.type }, deleted: !!curCat.deleted, updated_at: curCat.updated_at });
                     continue;
                 }
                 const catJson = (c: any) => JSON.stringify({ id: o.id, label: c.label, icon: c.icon, color: c.color, type: c.type });
                 if (o.op === 'delete') {
                     if (curCat && !curCat.deleted) {
-                        db.prepare('UPDATE categories SET deleted = 1, updated_at = ? WHERE owner = ? AND id = ?').run(ts, userId, o.id);
+                        db.prepare('UPDATE categories SET deleted = 1, updated_at = ?, version = version + 1 WHERE owner = ? AND id = ?').run(ts, userId, o.id);
                         addHist.run(Date.now(), device, 'cat', o.id, 'delete', catJson(curCat), null, userId);
                         applied++;
+                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied', version: nv });
+                    } else {
+                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied' });
                     }
-                    results.push({ id: o.id, status: 'applied' });
                     continue;
                 }
-                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid' }); continue; }
                 const d = o.data as any;
                 const label = String(d.label || '').trim().slice(0, 60);
-                if (!label) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (!label) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid' }); continue; }
                 const type = d.type === 'despesa' || d.type === 'receita' ? d.type : 'ambos';
                 const norm = normLabel(label);
                 // nome repetido (mesmo dono e tipo, outro id): o banco recusaria; avisamos bonito antes
                 const clash = db.prepare('SELECT id, label FROM categories WHERE owner = ? AND type = ? AND norm_label = ? AND deleted = 0 AND id != ?').get(userId, type, norm, o.id) as any;
-                if (clash) { results.push({ id: o.id, status: 'rejected', error: 'Você já tem a categoria "' + clash.label + '".' }); continue; }
-                db.prepare(`INSERT INTO categories (owner, id, label, norm_label, icon, color, type, updated_at, deleted) VALUES (?,?,?,?,?,?,?,?,0)
-                    ON CONFLICT(owner, id) DO UPDATE SET label=excluded.label, norm_label=excluded.norm_label, icon=excluded.icon, color=excluded.color, type=excluded.type, updated_at=excluded.updated_at, deleted=0`)
-                    .run(userId, o.id, label, norm, String(d.icon || '🏷️'), String(d.color || ''), type, ts);
+                if (clash) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'rejected', error: 'Você já tem a categoria "' + clash.label + '".' }); continue; }
+                db.prepare(`INSERT INTO categories (owner, id, label, norm_label, icon, color, type, updated_at, deleted, version) VALUES (?,?,?,?,?,?,?,?,0,?)
+                    ON CONFLICT(owner, id) DO UPDATE SET label=excluded.label, norm_label=excluded.norm_label, icon=excluded.icon, color=excluded.color, type=excluded.type, updated_at=excluded.updated_at, deleted=0, version=excluded.version`)
+                    .run(userId, o.id, label, norm, String(d.icon || '🏷️'), String(d.color || ''), type, ts, nv);
                 const after = JSON.stringify({ id: o.id, label, icon: String(d.icon || '🏷️'), color: String(d.color || ''), type });
                 addHist.run(Date.now(), device, 'cat', o.id, curCat && !curCat.deleted ? 'update' : 'create', curCat && !curCat.deleted ? catJson(curCat) : null, after, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied', version: nv });
                 continue;
             }
             // --- contas fixas vivem na tabela recs (v5): mesmas regras dos lancamentos ---
             if (o.entity === 'rec') {
-                const curRec = db.prepare('SELECT description, cat, cents, due_day, updated_at, deleted FROM recs WHERE owner = ? AND id = ?').get(userId, o.id) as any;
+                const curRec = db.prepare('SELECT description, cat, cents, due_day, updated_at, deleted, version FROM recs WHERE owner = ? AND id = ?').get(userId, o.id) as any;
+                const nv = (curRec ? curRec.version : 0) + 1;
                 const recJson = (r: any) => JSON.stringify({ id: o.id, desc: r.description, cat: r.cat, cents: r.cents, dueDay: r.due_day });
-                if (curRec && curRec.updated_at > ts) {
-                    results.push({ id: o.id, status: 'skipped', server: curRec.deleted ? null : JSON.parse(recJson(curRec)), deleted: !!curRec.deleted, updated_at: curRec.updated_at });
+                                if (casMode) {
+                                    // CAS (ramo sessao): a op so aplica sobre a versao que a aba viu.
+                                    // base_v null = create de id novo; divergencia = 'stale' com versao
+                                    // e conteudo oficiais — a tentativa vira conflito recuperavel no
+                                    // cliente. ts de cliente nao decide mais nada neste ramo.
+                                    const base = adotaBase(o, curRec ? curRec.version : 0);
+                                    if (!curRec) {
+                                        if (base !== null) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: 0, server: null, deleted: false }); continue; }
+                                    } else if (curRec.deleted) {
+                                        // delete de ja-deletado: noop-applied SO com base == version do
+                                        // tombstone; upsert sobre tombstone: SEMPRE stale.
+                                        if (o.op === 'delete' && base === curRec.version) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied' }); continue; }
+                                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: curRec.version, server: null, deleted: true, updated_at: curRec.updated_at }); continue;
+                                    } else if (base !== curRec.version) {
+                                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: curRec.version, server: JSON.parse(recJson(curRec)), deleted: false, updated_at: curRec.updated_at }); continue;
+                                    }
+                                } else if (curRec && curRec.updated_at > ts) {
+                    pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'skipped', version: curRec.version, server: curRec.deleted ? null : JSON.parse(recJson(curRec)), deleted: !!curRec.deleted, updated_at: curRec.updated_at });
                     continue; // ultima edicao vence: a do servidor e mais nova
                 }
                 if (o.op === 'delete') {
                     if (curRec && !curRec.deleted) {
-                        db.prepare('UPDATE recs SET deleted = 1, updated_at = ? WHERE owner = ? AND id = ?').run(ts, userId, o.id);
+                        db.prepare('UPDATE recs SET deleted = 1, updated_at = ?, version = version + 1 WHERE owner = ? AND id = ?').run(ts, userId, o.id);
                         addHist.run(Date.now(), device, 'rec', o.id, 'delete', recJson(curRec), null, userId);
                         applied++;
+                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied', version: nv });
+                    } else {
+                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied' });
                     }
-                    results.push({ id: o.id, status: 'applied' });
                     continue;
                 }
-                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid' }); continue; }
                 const d = o.data as any;
-                if (d.id !== o.id || !validNewRec(d)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (d.id !== o.id || !validNewRec(d)) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid' }); continue; }
                 // a categoria precisa existir (chave estrangeira): avisa bonito em vez de estourar o lote
                 if (!db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?').get(userId, String(d.cat))) {
-                    results.push({ id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
+                    pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'rejected', error: 'Categoria não encontrada.' });
                     continue;
                 }
                 const desc = capFirst(String(d.desc));
-                db.prepare(`INSERT INTO recs (owner, id, description, cat, cents, due_day, updated_at, deleted) VALUES (?,?,?,?,?,?,?,0)
-                    ON CONFLICT(owner, id) DO UPDATE SET description=excluded.description, cat=excluded.cat, cents=excluded.cents, due_day=excluded.due_day, updated_at=excluded.updated_at, deleted=0`)
-                    .run(userId, o.id, desc, String(d.cat), d.cents, d.dueDay, ts);
+                db.prepare(`INSERT INTO recs (owner, id, description, cat, cents, due_day, updated_at, deleted, version) VALUES (?,?,?,?,?,?,?,0,?)
+                    ON CONFLICT(owner, id) DO UPDATE SET description=excluded.description, cat=excluded.cat, cents=excluded.cents, due_day=excluded.due_day, updated_at=excluded.updated_at, deleted=0, version=excluded.version`)
+                    .run(userId, o.id, desc, String(d.cat), d.cents, d.dueDay, ts, nv);
                 const after = JSON.stringify({ id: o.id, desc, cat: String(d.cat), cents: d.cents, dueDay: d.dueDay });
                 addHist.run(Date.now(), device, 'rec', o.id, curRec && !curRec.deleted ? 'update' : 'create', curRec && !curRec.deleted ? recJson(curRec) : null, after, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied', version: nv });
                 continue;
             }
             // --- sugestoes de categoria vivem na tabela catrules (v6): mesmas regras ---
             if (o.entity === 'catrule') {
-                const curRule = db.prepare('SELECT rule_key, description, cat, type, at, updated_at, deleted FROM catrules WHERE owner = ? AND rule_key = ?').get(userId, o.id) as any;
+                const curRule = db.prepare('SELECT rule_key, description, cat, type, at, updated_at, deleted, version FROM catrules WHERE owner = ? AND rule_key = ?').get(userId, o.id) as any;
+                const nv = (curRule ? curRule.version : 0) + 1;
                 const ruleJson = (r: any) => JSON.stringify({ key: o.id, desc: r.description, cat: r.cat, type: r.type, at: r.at });
-                if (curRule && curRule.updated_at > ts) {
-                    results.push({ id: o.id, status: 'skipped', server: curRule.deleted ? null : JSON.parse(ruleJson(curRule)), deleted: !!curRule.deleted, updated_at: curRule.updated_at });
+                                if (casMode) {
+                                    // CAS (ramo sessao): a op so aplica sobre a versao que a aba viu.
+                                    // base_v null = create de id novo; divergencia = 'stale' com versao
+                                    // e conteudo oficiais — a tentativa vira conflito recuperavel no
+                                    // cliente. ts de cliente nao decide mais nada neste ramo.
+                                    const base = adotaBase(o, curRule ? curRule.version : 0);
+                                    if (!curRule) {
+                                        if (base !== null) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: 0, server: null, deleted: false }); continue; }
+                                    } else if (curRule.deleted) {
+                                        // delete de ja-deletado: noop-applied SO com base == version do tombstone.
+                                        if (o.op === 'delete' && base === curRule.version) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied' }); continue; }
+                                        // Recriacao EXPLICITA de regra apagada (reaplicar de conflito):
+                                        // revive a mesma chave SO quando a op prova ter visto exatamente
+                                        // ESTE tombstone (base == versao dele) — cai no upsert normal
+                                        // abaixo (deleted=0, version+1). Create cego (base null) e base
+                                        // de outra versao continuam stale: nunca auto-ressurreicao.
+                                        if (!(o.op === 'upsert' && base === curRule.version)) {
+                                            pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: curRule.version, server: null, deleted: true, updated_at: curRule.updated_at }); continue;
+                                        }
+                                    } else if (base !== curRule.version) {
+                                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: curRule.version, server: JSON.parse(ruleJson(curRule)), deleted: false, updated_at: curRule.updated_at }); continue;
+                                    }
+                                } else if (curRule && curRule.updated_at > ts) {
+                    pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'skipped', version: curRule.version, server: curRule.deleted ? null : JSON.parse(ruleJson(curRule)), deleted: !!curRule.deleted, updated_at: curRule.updated_at });
                     continue; // ultima edicao vence: a do servidor e mais nova
                 }
                 if (o.op === 'delete') {
                     if (curRule && !curRule.deleted) {
-                        db.prepare('UPDATE catrules SET deleted = 1, updated_at = ? WHERE owner = ? AND rule_key = ?').run(ts, userId, o.id);
+                        db.prepare('UPDATE catrules SET deleted = 1, updated_at = ?, version = version + 1 WHERE owner = ? AND rule_key = ?').run(ts, userId, o.id);
                         addHist.run(Date.now(), device, 'catrule', o.id, 'delete', ruleJson(curRule), null, userId);
                         applied++;
+                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied', version: nv });
+                    } else {
+                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied' });
                     }
-                    results.push({ id: o.id, status: 'applied' });
                     continue;
                 }
-                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid' }); continue; }
                 const d = o.data as any;
-                if (d.key !== o.id || !validNewCatrule(d)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (d.key !== o.id || !validNewCatrule(d)) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid' }); continue; }
                 // a categoria precisa existir (chave estrangeira): avisa bonito em vez de estourar o lote
                 if (!db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?').get(userId, String(d.cat))) {
-                    results.push({ id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
+                    pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'rejected', error: 'Categoria não encontrada.' });
                     continue;
                 }
                 const desc = capFirst(String(d.desc));
-                db.prepare(`INSERT INTO catrules (owner, rule_key, description, cat, type, at, updated_at, deleted) VALUES (?,?,?,?,?,?,?,0)
-                    ON CONFLICT(owner, rule_key) DO UPDATE SET description=excluded.description, cat=excluded.cat, type=excluded.type, at=excluded.at, updated_at=excluded.updated_at, deleted=0`)
-                    .run(userId, o.id, desc, String(d.cat), String(d.type), String(d.at), ts);
+                db.prepare(`INSERT INTO catrules (owner, rule_key, description, cat, type, at, updated_at, deleted, version) VALUES (?,?,?,?,?,?,?,0,?)
+                    ON CONFLICT(owner, rule_key) DO UPDATE SET description=excluded.description, cat=excluded.cat, type=excluded.type, at=excluded.at, updated_at=excluded.updated_at, deleted=0, version=excluded.version`)
+                    .run(userId, o.id, desc, String(d.cat), String(d.type), String(d.at), ts, nv);
                 const after = JSON.stringify({ key: o.id, desc, cat: String(d.cat), type: String(d.type), at: String(d.at) });
                 addHist.run(Date.now(), device, 'catrule', o.id, curRule && !curRule.deleted ? 'update' : 'create', curRule && !curRule.deleted ? ruleJson(curRule) : null, after, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied', version: nv });
                 continue;
             }
             // --- lancamentos vivem na tabela transactions (v4): colunas de verdade, categoria com chave estrangeira ---
             if (o.entity === 'tx') {
-                const curTx = db.prepare('SELECT date, description, cat, cents, type, rec_key, fitid, updated_at, deleted FROM transactions WHERE owner = ? AND id = ?').get(userId, o.id) as any;
+                const curTx = db.prepare('SELECT date, description, cat, cents, type, rec_key, fitid, updated_at, deleted, version FROM transactions WHERE owner = ? AND id = ?').get(userId, o.id) as any;
+                const nv = (curTx ? curTx.version : 0) + 1;
                 const txJson = (t: any) => JSON.stringify({ id: o.id, date: t.date, desc: t.description, cat: t.cat, cents: t.cents, type: t.type, ...(t.rec_key ? { recKey: t.rec_key } : {}), ...(t.fitid ? { fitid: t.fitid } : {}) });
-                if (curTx && curTx.updated_at > ts) {
-                    results.push({ id: o.id, status: 'skipped', server: curTx.deleted ? null : JSON.parse(txJson(curTx)), deleted: !!curTx.deleted, updated_at: curTx.updated_at });
+                                if (casMode) {
+                                    // CAS (ramo sessao): a op so aplica sobre a versao que a aba viu.
+                                    // base_v null = create de id novo; divergencia = 'stale' com versao
+                                    // e conteudo oficiais — a tentativa vira conflito recuperavel no
+                                    // cliente. ts de cliente nao decide mais nada neste ramo.
+                                    const base = adotaBase(o, curTx ? curTx.version : 0);
+                                    if (!curTx) {
+                                        if (base !== null) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: 0, server: null, deleted: false }); continue; }
+                                    } else if (curTx.deleted) {
+                                        // delete de ja-deletado: noop-applied SO com base == version do
+                                        // tombstone; upsert sobre tombstone: SEMPRE stale.
+                                        if (o.op === 'delete' && base === curTx.version) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied' }); continue; }
+                                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: curTx.version, server: null, deleted: true, updated_at: curTx.updated_at }); continue;
+                                    } else if (base !== curTx.version) {
+                                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: curTx.version, server: JSON.parse(txJson(curTx)), deleted: false, updated_at: curTx.updated_at }); continue;
+                                    }
+                                } else if (curTx && curTx.updated_at > ts) {
+                    pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'skipped', version: curTx.version, server: curTx.deleted ? null : JSON.parse(txJson(curTx)), deleted: !!curTx.deleted, updated_at: curTx.updated_at });
                     continue; // ultima edicao vence: a do servidor e mais nova
                 }
                 if (o.op === 'delete') {
                     if (curTx && !curTx.deleted) {
-                        db.prepare('UPDATE transactions SET deleted = 1, updated_at = ? WHERE owner = ? AND id = ?').run(ts, userId, o.id);
+                        db.prepare('UPDATE transactions SET deleted = 1, updated_at = ?, version = version + 1 WHERE owner = ? AND id = ?').run(ts, userId, o.id);
                         addHist.run(Date.now(), device, 'tx', o.id, 'delete', txJson(curTx), null, userId);
                         applied++;
+                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied', version: nv });
+                    } else {
+                        pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied' });
                     }
-                    results.push({ id: o.id, status: 'applied' });
                     continue;
                 }
-                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid' }); continue; }
                 const d = o.data as any;
-                if (d.id !== o.id || !validNewTx(d)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (d.id !== o.id || !validNewTx(d)) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid' }); continue; }
                 // a categoria precisa existir (chave estrangeira): avisa bonito em vez de estourar o lote
                 if (!db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?').get(userId, String(d.cat))) {
-                    results.push({ id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
+                    pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'rejected', error: 'Categoria não encontrada.' });
                     continue;
                 }
                 const desc = capFirst(String(d.desc));
                 const recKey = d.recKey ? String(d.recKey) : null;
                 const fitid = d.fitid ? String(d.fitid) : null;
-                db.prepare(`INSERT INTO transactions (owner, id, date, description, cat, cents, type, rec_key, fitid, updated_at, deleted) VALUES (?,?,?,?,?,?,?,?,?,?,0)
-                    ON CONFLICT(owner, id) DO UPDATE SET date=excluded.date, description=excluded.description, cat=excluded.cat, cents=excluded.cents, type=excluded.type, rec_key=excluded.rec_key, fitid=excluded.fitid, updated_at=excluded.updated_at, deleted=0`)
-                    .run(userId, o.id, String(d.date), desc, String(d.cat), d.cents, d.type, recKey, fitid, ts);
+                db.prepare(`INSERT INTO transactions (owner, id, date, description, cat, cents, type, rec_key, fitid, updated_at, deleted, version) VALUES (?,?,?,?,?,?,?,?,?,?,0,?)
+                    ON CONFLICT(owner, id) DO UPDATE SET date=excluded.date, description=excluded.description, cat=excluded.cat, cents=excluded.cents, type=excluded.type, rec_key=excluded.rec_key, fitid=excluded.fitid, updated_at=excluded.updated_at, deleted=0, version=excluded.version`)
+                    .run(userId, o.id, String(d.date), desc, String(d.cat), d.cents, d.type, recKey, fitid, ts, nv);
                 const after = JSON.stringify({ id: o.id, date: String(d.date), desc, cat: String(d.cat), cents: d.cents, type: d.type, ...(recKey ? { recKey } : {}), ...(fitid ? { fitid } : {}) });
                 addHist.run(Date.now(), device, 'tx', o.id, curTx && !curTx.deleted ? 'update' : 'create', curTx && !curTx.deleted ? txJson(curTx) : null, after, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied', version: nv });
                 continue;
             }
             const cur = getRec.get(o.entity, o.id, userId) as any;
-            if (cur && cur.updated_at > ts) {
-                results.push({ id: o.id, status: 'skipped', server: cur.deleted ? null : JSON.parse(cur.data), deleted: !!cur.deleted, updated_at: cur.updated_at });
+            const nv = (cur ? cur.version : 0) + 1;
+                        if (casMode) {
+                                // CAS (ramo sessao): a op so aplica sobre a versao que a aba viu.
+                                // base_v null = create de id novo; divergencia = 'stale' com versao
+                                // e conteudo oficiais — a tentativa vira conflito recuperavel no
+                                // cliente. ts de cliente nao decide mais nada neste ramo.
+                                const base = adotaBase(o, cur ? cur.version : 0);
+                                if (!cur) {
+                                    if (base !== null) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: 0, server: null, deleted: false }); continue; }
+                                } else if (cur.deleted) {
+                                    // delete de ja-deletado: noop-applied SO com base == version do
+                                    // tombstone; upsert sobre tombstone: SEMPRE stale.
+                                    if (o.op === 'delete' && base === cur.version) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied' }); continue; }
+                                    pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: cur.version, server: null, deleted: true, updated_at: cur.updated_at }); continue;
+                                } else if (base !== cur.version) {
+                                    pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'stale', version: cur.version, server: JSON.parse(cur.data), deleted: false, updated_at: cur.updated_at }); continue;
+                                }
+                            } else if (cur && cur.updated_at > ts) {
+                pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'skipped', version: cur.version, server: cur.deleted ? null : JSON.parse(cur.data), deleted: !!cur.deleted, updated_at: cur.updated_at });
                 continue; // ultima edicao vence: a do servidor e mais nova
             }
             const before = cur && !cur.deleted ? cur.data : null;
             if (o.op === 'delete') {
-                if (!cur || cur.deleted) { results.push({ id: o.id, status: 'applied' }); continue; }
-                upRec.run({ entity: o.entity, id: o.id, owner: userId, updated_at: ts, deleted: 1, data: cur.data });
+                if (!cur || cur.deleted) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied' }); continue; }
+                upRec.run({ entity: o.entity, id: o.id, owner: userId, updated_at: ts, deleted: 1, data: cur.data, version: nv });
                 addHist.run(Date.now(), device, o.entity, o.id, 'delete', before, null, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied', version: nv });
             } else if (o.op === 'upsert') {
-                if (o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid' }); continue; }
                 const data = JSON.stringify(o.data);
-                if (data.length > 200000) { results.push({ id: o.id, status: 'invalid' }); continue; }
-                upRec.run({ entity: o.entity, id: o.id, owner: userId, updated_at: ts, deleted: 0, data });
+                if (data.length > 200000) { pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid' }); continue; }
+                upRec.run({ entity: o.entity, id: o.id, owner: userId, updated_at: ts, deleted: 0, data, version: nv });
                 addHist.run(Date.now(), device, o.entity, o.id, cur && !cur.deleted ? 'update' : 'create', before, data, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'applied', version: nv });
             } else {
-                results.push({ id: o.id, status: 'invalid' });
+                pushRes(o, { entity: o.entity, id: o.id, ts: o.ts, status: 'invalid' });
             }
         }
     });
@@ -675,7 +908,7 @@ const server = http.createServer(async (req, res) => {
             if (body.password !== body.confirm) return send(res, 400, { error: 'As duas senhas não conferem.' });
             db.prepare('INSERT INTO users (id, username, pass_hash, created_at, is_admin, active) VALUES (1, ?, ?, ?, 1, 1)').run(user, hashPassword(body.password), Date.now());
             const device = String(body.device || '').slice(0, 80);
-            const s = createSession(device, 1);
+            const s = createSession(device, 1, String(req.headers['user-agent'] || ''));
             return send(res, 200, { ok: true }, { 'set-cookie': cookieHeader(s.token, SESSION_TTL_MS / 1000) });
         }
 
@@ -689,7 +922,7 @@ const server = http.createServer(async (req, res) => {
             if (!row || !row.active || !ok) { noteFail(key); return send(res, 401, { error: 'Usuário ou senha incorretos.' }); } // desativado: mesmo erro generico, sem revelar
             clearFails(key);
             const device = String(body.device || '').slice(0, 80);
-            const s = createSession(device, row.id);
+            const s = createSession(device, row.id, String(req.headers['user-agent'] || ''));
             return send(res, 200, { ok: true }, { 'set-cookie': cookieHeader(s.token, SESSION_TTL_MS / 1000) });
         }
 
@@ -723,7 +956,7 @@ const server = http.createServer(async (req, res) => {
             if (newId === 'invite') return send(res, 401, { error: 'Convite inválido ou vencido.' }); // generico: nao distingue inexistente/usado/vencido
             if (newId === 'taken') return send(res, 409, { error: 'Esse nome de usuário já está em uso.' });
             const device = String(body.device || '').slice(0, 80);
-            const s = createSession(device, newId);
+            const s = createSession(device, newId, String(req.headers['user-agent'] || ''));
             return send(res, 200, { ok: true }, { 'set-cookie': cookieHeader(s.token, SESSION_TTL_MS / 1000) });
         }
 
@@ -790,21 +1023,25 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'GET' && p === '/api/state') {
             const out: Record<string, any[]> = {};
             for (const e of ENTITIES) out[e] = [];
-            const rows = db.prepare("SELECT entity, data FROM records WHERE deleted = 0 AND owner = ? AND entity NOT IN ('cat', 'tx', 'rec', 'catrule')").all(auth.userId) as any[];
-            for (const r of rows) out[r.entity].push(JSON.parse(r.data));
+            // Mapa id -> versao do servidor, por entidade, separado do JSON do
+            // registro: o app usa para detectar base desatualizada (etapa futura).
+            const versions: Record<string, Record<string, number>> = {};
+            for (const e of ENTITIES) versions[e] = {};
+            const rows = db.prepare("SELECT entity, id, data, version FROM records WHERE deleted = 0 AND owner = ? AND entity NOT IN ('cat', 'tx', 'rec', 'catrule')").all(auth.userId) as any[];
+            for (const r of rows) { out[r.entity].push(JSON.parse(r.data)); versions[r.entity][r.id] = r.version; }
             // categorias vem da tabela (fonte da verdade), no mesmo formato de record que o app espera
-            const catRows = db.prepare('SELECT id, label, icon, color, type FROM categories WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
-            for (const c of catRows) out['cat'].push({ id: c.id, label: c.label, icon: c.icon, color: c.color, type: c.type });
+            const catRows = db.prepare('SELECT id, label, icon, color, type, version FROM categories WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
+            for (const c of catRows) { out['cat'].push({ id: c.id, label: c.label, icon: c.icon, color: c.color, type: c.type }); versions['cat'][c.id] = c.version; }
             // lancamentos vem da tabela (fonte da verdade), no mesmo formato JSON que o app espera
-            const txRows = db.prepare('SELECT id, date, description, cat, cents, type, rec_key, fitid FROM transactions WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
-            for (const t of txRows) out['tx'].push({ id: t.id, date: t.date, desc: t.description, cat: t.cat, cents: t.cents, type: t.type, ...(t.rec_key ? { recKey: t.rec_key } : {}), ...(t.fitid ? { fitid: t.fitid } : {}) });
+            const txRows = db.prepare('SELECT id, date, description, cat, cents, type, rec_key, fitid, version FROM transactions WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
+            for (const t of txRows) { out['tx'].push({ id: t.id, date: t.date, desc: t.description, cat: t.cat, cents: t.cents, type: t.type, ...(t.rec_key ? { recKey: t.rec_key } : {}), ...(t.fitid ? { fitid: t.fitid } : {}) }); versions['tx'][t.id] = t.version; }
             // contas fixas vem da tabela (fonte da verdade), no mesmo formato JSON que o app espera
-            const recRows = db.prepare('SELECT id, description, cat, cents, due_day FROM recs WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
-            for (const r of recRows) out['rec'].push({ id: r.id, desc: r.description, cat: r.cat, cents: r.cents, dueDay: r.due_day });
+            const recRows = db.prepare('SELECT id, description, cat, cents, due_day, version FROM recs WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
+            for (const r of recRows) { out['rec'].push({ id: r.id, desc: r.description, cat: r.cat, cents: r.cents, dueDay: r.due_day }); versions['rec'][r.id] = r.version; }
             // sugestoes de categoria vem da tabela (fonte da verdade), no mesmo formato JSON que o app espera
-            const ruleRows = db.prepare('SELECT rule_key, description, cat, type, at FROM catrules WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
-            for (const r of ruleRows) out['catrule'].push({ key: r.rule_key, desc: r.description, cat: r.cat, type: r.type, at: r.at });
-            return send(res, 200, { serverTime: Date.now(), records: out });
+            const ruleRows = db.prepare('SELECT rule_key, description, cat, type, at, version FROM catrules WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
+            for (const r of ruleRows) { out['catrule'].push({ key: r.rule_key, desc: r.description, cat: r.cat, type: r.type, at: r.at }); versions['catrule'][r.rule_key] = r.version; }
+            return send(res, 200, { serverTime: Date.now(), records: out, versions, ...(sess ? { username: sess.username } : {}) });
         }
 
         if (req.method === 'POST' && p === '/api/sync') {
@@ -830,12 +1067,22 @@ const server = http.createServer(async (req, res) => {
                         return send(res, 400, { error: 'Operação inválida.' });
                     }
                 }
-                const r = applyOps(auth.device, auth.userId, ops);
+                const r = applyOps(auth.device, auth.userId, ops, false); // ramo token de servico: contrato atual preservado (LWW), nenhum caminho novo
                 return send(res, 200, { serverTime: Date.now(), applied: r.applied, results: r.results });
             }
+            // Cliente novo sempre declara a conta dona da fila. Sem o campo e
+            // cliente antigo: bloqueado ate recarregar — nada e aplicado e a
+            // fila dele fica intacta no aparelho.
+            // Com campo divergente do cookie: fila cruzada barrada igualmente.
+            if (body.username === undefined) return send(res, 409, { error: 'Versão antiga do app. Recarregue a página para sincronizar.' });
+            if (normUser(String(body.username)) !== sess!.username) return send(res, 409, { error: 'A conta mudou neste aparelho. Entre de novo para sincronizar.' });
             const ops = Array.isArray(body.ops) ? body.ops.slice(0, 2000) : [];
+            // Portao de versao do app: cliente antigo nao manda base_v — recusa o
+            // lote INTEIRO sem aplicar nada; a fila do aparelho fica intacta ate
+            // recarregar. Sem LWW silencioso para app velho.
+            if (ops.some((o: any) => o && typeof o === 'object' && o.base_v === undefined)) return send(res, 409, { error: 'Pendências de antes da atualização do app.', code: 'legacy_queue' });
             const device = String(body.device || auth.device || '').slice(0, 80);
-            const r = applyOps(device, auth.userId, ops);
+            const r = applyOps(device, auth.userId, ops, true); // ramo sessao: CAS por versao
             return send(res, 200, { serverTime: Date.now(), applied: r.applied, results: r.results });
         }
 
@@ -871,6 +1118,35 @@ const server = http.createServer(async (req, res) => {
             return send(res, n ? 200 : 404, { ok: !!n, error: n ? undefined : 'Acesso não encontrado.' });
         }
 
+        // ---------- Aparelhos conectados (sessoes do proprio usuario) ----------
+        // Regras: so sessao de login (token de IA nao lista nem encerra); cada
+        // usuario so ve e so encerra as PROPRIAS sessoes — pedido de sessao alheia
+        // responde "nao encontrada", sem vazar nem a existencia. A lista nunca
+        // devolve token nem hash: o id publico e aleatorio e so serve de referencia.
+        if (req.method === 'GET' && p === '/api/sessions') {
+            if (auth.kind !== 'session' || !sess) return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
+            const cur = sha256(sess.token);
+            const now = Date.now();
+            const rows = db.prepare('SELECT public_id, device, created_at, token_hash FROM sessions WHERE user_id = ? AND expires_at > ? ORDER BY created_at DESC').all(auth.userId, now) as any[];
+            return send(res, 200, {
+                sessions: rows.map(r => ({ id: r.public_id, device: r.device, created_at: r.created_at, current: r.token_hash === cur })),
+            });
+        }
+
+        if (req.method === 'POST' && p === '/api/sessions/close') {
+            if (auth.kind !== 'session') return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
+            const body = await readBody(req);
+            const id = String(body.id || '').slice(0, 64);
+            const n = db.prepare('DELETE FROM sessions WHERE user_id = ? AND public_id = ?').run(auth.userId, id).changes;
+            return send(res, n ? 200 : 404, { ok: !!n, error: n ? undefined : 'Sessão não encontrada.' });
+        }
+
+        if (req.method === 'POST' && p === '/api/sessions/close-others') {
+            if (auth.kind !== 'session' || !sess) return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
+            const n = db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?').run(auth.userId, sha256(sess.token)).changes;
+            return send(res, 200, { ok: true, closed: n });
+        }
+
         if (req.method === 'GET' && p === '/api/history') {
             const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 50, 1), 200);
             const device = String(url.searchParams.get('device') || '').slice(0, 80);
@@ -879,6 +1155,7 @@ const server = http.createServer(async (req, res) => {
                 : db.prepare('SELECT seq, ts, device, entity, rid, op, before, after FROM history WHERE owner = ? ORDER BY seq DESC LIMIT ?').all(auth.userId, limit)) as any[];
             return send(res, 200, {
                 entries: rows.map(r => ({ ...r, before: r.before ? JSON.parse(r.before) : null, after: r.after ? JSON.parse(r.after) : null })),
+                ...(sess ? { username: sess.username } : {}),
             });
         }
 

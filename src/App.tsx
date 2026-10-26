@@ -1,8 +1,13 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useLocalState } from './localState';
+import {setSyncWarnHandler, txKey, colKey, freezeBase, unfreezeBase, pinBase, pushDelete, readFreshCollection, seedSnap, snapLookup, listConflicts, dismissConflict, setConflictsHandler, avisoPersistente } from './sync';
+import type { ConflictItem } from './sync';
 import { decryptBackupJson, encryptBackupJson, isEncryptedBackup } from './crypto';
 import { HistoryModal } from './gate';
 import { capFirst } from './format';
+import { v2IsActive, v2Collection, v2Subscribe, v2Mutate, v2Conflicts, v2Reaplicar, v2Descartar, v2FreezeBase, v2UnfreezeBase, v2MotorLigado, v2Bloqueadas, v2CorrigirBloqueada } from './idb/v2store';
+import { v2MotorAviso, v2MotorDescartarBloqueada } from './idb/motor';
+import type { ConflictRecordV2, SyncOpV2 } from './idb/syncIDB';
 import './style.css';
 import heroImg from './photos/hero.png';
 
@@ -175,39 +180,42 @@ function salvageRows(joined: string): Tx[] {
 }
 
 // Fatias fixas de texto no localStorage (cada uma bem abaixo do limite do navegador).
+// Snapshot estavel do espelho v2 (mesma referencia entre notificacoes).
+const v2TxsSnapshot = (): Tx[] => v2Collection('tx') as unknown as Tx[];
+
 function useChunkedTxs(): [Tx[], (v: Tx[]) => boolean, { ready: boolean; message: string; failed: boolean; salvage: boolean }] {
-    const h0 = useLocalState('mf.txs.0', '');
-    const h1 = useLocalState('mf.txs.1', '');
-    const h2 = useLocalState('mf.txs.2', '');
-    const h3 = useLocalState('mf.txs.3', '');
-    const h4 = useLocalState('mf.txs.4', '');
-    const h5 = useLocalState('mf.txs.5', '');
-    const h6 = useLocalState('mf.txs.6', '');
-    const h7 = useLocalState('mf.txs.7', '');
-    const h8 = useLocalState('mf.txs.8', '');
-    const h9 = useLocalState('mf.txs.9', '');
-    const h10 = useLocalState('mf.txs.10', '');
-    const h11 = useLocalState('mf.txs.11', '');
-    const h12 = useLocalState('mf.txs.12', '');
-    const h13 = useLocalState('mf.txs.13', '');
-    const h14 = useLocalState('mf.txs.14', '');
-    const h15 = useLocalState('mf.txs.15', '');
-    const h16 = useLocalState('mf.txs.16', '');
-    const h17 = useLocalState('mf.txs.17', '');
-    const h18 = useLocalState('mf.txs.18', '');
-    const h19 = useLocalState('mf.txs.19', '');
-    const h20 = useLocalState('mf.txs.20', '');
-    const h21 = useLocalState('mf.txs.21', '');
-    const h22 = useLocalState('mf.txs.22', '');
-    const h23 = useLocalState('mf.txs.23', '');
-    const h24 = useLocalState('mf.txs.24', '');
-    const h25 = useLocalState('mf.txs.25', '');
-    const h26 = useLocalState('mf.txs.26', '');
-    const h27 = useLocalState('mf.txs.27', '');
-    const h28 = useLocalState('mf.txs.28', '');
-    const h29 = useLocalState('mf.txs.29', '');
-    const h30 = useLocalState('mf.txs.30', '');
-    const h31 = useLocalState('mf.txs.31', '');
+    const h0 = useLocalState(txKey(0), '');
+    const h1 = useLocalState(txKey(1), '');
+    const h2 = useLocalState(txKey(2), '');
+    const h3 = useLocalState(txKey(3), '');
+    const h4 = useLocalState(txKey(4), '');
+    const h5 = useLocalState(txKey(5), '');
+    const h6 = useLocalState(txKey(6), '');
+    const h7 = useLocalState(txKey(7), '');
+    const h8 = useLocalState(txKey(8), '');
+    const h9 = useLocalState(txKey(9), '');
+    const h10 = useLocalState(txKey(10), '');
+    const h11 = useLocalState(txKey(11), '');
+    const h12 = useLocalState(txKey(12), '');
+    const h13 = useLocalState(txKey(13), '');
+    const h14 = useLocalState(txKey(14), '');
+    const h15 = useLocalState(txKey(15), '');
+    const h16 = useLocalState(txKey(16), '');
+    const h17 = useLocalState(txKey(17), '');
+    const h18 = useLocalState(txKey(18), '');
+    const h19 = useLocalState(txKey(19), '');
+    const h20 = useLocalState(txKey(20), '');
+    const h21 = useLocalState(txKey(21), '');
+    const h22 = useLocalState(txKey(22), '');
+    const h23 = useLocalState(txKey(23), '');
+    const h24 = useLocalState(txKey(24), '');
+    const h25 = useLocalState(txKey(25), '');
+    const h26 = useLocalState(txKey(26), '');
+    const h27 = useLocalState(txKey(27), '');
+    const h28 = useLocalState(txKey(28), '');
+    const h29 = useLocalState(txKey(29), '');
+    const h30 = useLocalState(txKey(30), '');
+    const h31 = useLocalState(txKey(31), '');
     const hooks = [h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18, h19, h20, h21, h22, h23, h24, h25, h26, h27, h28, h29, h30, h31];
     const ready = hooks.every(h => h[2] && h[2].ready);
     const message = Array.from(new Set(hooks.map(h => (h[2] && h[2].message) || '').filter(Boolean))).join(' ');
@@ -229,12 +237,39 @@ function useChunkedTxs(): [Tx[], (v: Tx[]) => boolean, { ready: boolean; message
         const s = JSON.stringify(v.map(packTx));
         if (s.length > CHUNKS * CHUNK_CAP) return false;
         const parts = packChunks(s);
+        const oldParts: (string | null)[] = [];
+        for (let i = 0; i < CHUNKS; i++) { try { oldParts[i] = window.localStorage.getItem(txKey(i)); } catch { oldParts[i] = null; } }
         let ok = true;
         // Grava do fim para o começo: libera as fatias antigas grandes antes de escrever as novas, sem estourar a cota total no meio do caminho.
         for (let i = CHUNKS - 1; i >= 0; i--) { if (!hooks[i][1](parts[i])) ok = false; }
+        if (!ok) {
+            // Gravacao incompleta (quota na colecao ou na fila de envio):
+            // restaura TODAS as fatias antigas — colecao/snap/estado oficial
+            // continuam consistentes e o chamador avisa; nada diverge.
+            for (let i = CHUNKS - 1; i >= 0; i--) {
+                const old = oldParts[i];
+                let txt = '';
+                if (old !== null) { try { const p = JSON.parse(old) as unknown; if (typeof p === 'string') txt = p; } catch { /* melhor esforco */ } }
+                try { hooks[i][1](txt); } catch { avisoPersistente('falha ao restaurar as fatias anteriores — exporte um backup'); }
+            }
+        }
         return ok;
     };
+    // Caminho v2 EXPERIMENTAL (ensaio): os 32 hooks v1 rodam sempre (ordem de
+    // hooks fixa), mas a colecao vem do espelho IDB carregado no boot. O setter
+    // v1 NAO escreve neste modo (retorna false): escrita e so via mergeTxs->v2Mutate.
+    const v2txs = useSyncExternalStore(v2Subscribe, v2TxsSnapshot);
+    if (v2IsActive()) return [v2txs, () => false, { ready: true, message: '', failed: false, salvage: false }];
     return [txs, set, { ready, message, failed, salvage }];
+}
+
+// Colecao v1 (localStorage) ou espelho v2 (IDB): os DOIS hooks rodam sempre
+// (ordem fixa) e a selecao acontece na saida. No modo v2 o setter v1 nao escreve.
+function useCol<T>(key: string, entity: 'cat' | 'rec' | 'catrule', seed: T[]): [T[], (v: T[]) => boolean, { ready: boolean; message: string }] {
+    const v1 = useLocalState<T[]>(key, seed);
+    const v2arr = useSyncExternalStore(v2Subscribe, () => v2Collection(entity) as unknown as T[]);
+    if (v2IsActive()) return [v2arr, () => false, { ready: true, message: '' }];
+    return v1;
 }
 
 // ---------- leitura de XLSX (sem dependências) ----------
@@ -490,7 +525,7 @@ function modalClosed() {
     if (modalCount === 0) shellPost({ type: 'modal', value: false });
 }
 
-function Overlay({ onClose, children }: { onClose?: () => void; children: React.ReactNode }) {
+function Overlay({ onClose, children, className }: { onClose?: () => void; children: React.ReactNode; className?: string }) {
     const [vp, setVp] = useState<VpInfo | null>(lastVp);
     useEffect(() => {
         attachVpListener();
@@ -517,7 +552,7 @@ function Overlay({ onClose, children }: { onClose?: () => void; children: React.
     const style: React.CSSProperties | undefined = vp
         ? { position: 'absolute', top: vp.top, left: 0, right: 0, height: vp.height, inset: 'auto' }
         : undefined;
-    return <div className="overlay" style={style} onClick={onClose}>{children}</div>;
+    return <div className={'overlay' + (className ? ' ' + className : '')} style={style} onClick={onClose}>{children}</div>;
 }
 
 
@@ -650,6 +685,80 @@ function AIAccessSheet({ onClose }: { onClose: () => void }) {
     </>;
 }
 
+// ---------- Aparelhos conectados (sessões de login do app) ----------
+interface SessionInfo { id: string; device: string; created_at: number; current: boolean }
+
+function DevicesSheet({ onClose }: { onClose: () => void }) {
+    const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
+    const [err, setErr] = useState('');
+    const [busy, setBusy] = useState(false);
+    const [confirmId, setConfirmId] = useState('');
+    const [confirmOthers, setConfirmOthers] = useState(false);
+
+    const load = () => {
+        fetch('/api/sessions', { credentials: 'same-origin' })
+            .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+            .then(b => setSessions(b.sessions || []))
+            .catch(() => setErr('Não consegui carregar os aparelhos agora.'));
+    };
+    useEffect(load, []);
+
+    const closeOne = async (id: string) => {
+        setBusy(true); setErr('');
+        try {
+            const r = await fetch('/api/sessions/close', {
+                method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ id }),
+            });
+            const b = await r.json().catch(() => ({}));
+            if (!r.ok) { setErr(b.error || 'Não deu certo. Tente de novo.'); return; }
+            setConfirmId(''); load();
+        } catch { setErr('Sem conexão com o servidor.'); }
+        finally { setBusy(false); }
+    };
+
+    const closeOthers = async () => {
+        setBusy(true); setErr('');
+        try {
+            const r = await fetch('/api/sessions/close-others', { method: 'POST', credentials: 'same-origin' });
+            const b = await r.json().catch(() => ({}));
+            if (!r.ok) { setErr(b.error || 'Não deu certo. Tente de novo.'); return; }
+            setConfirmOthers(false); load();
+        } catch { setErr('Sem conexão com o servidor.'); }
+        finally { setBusy(false); }
+    };
+
+    const others = (sessions || []).filter(s => !s.current);
+
+    return <>
+        <div className="sheethead"><h2>Aparelhos conectados</h2><button className="sheetx" aria-label="Fechar" onClick={onClose}>✕</button></div>
+        <p className="hint">Cada item é um login feito no app. Se não reconhecer algum, encerre o acesso dele: ele volta para a tela de login.</p>
+        {err && <p className="error">{err}</p>}
+        {sessions === null && !err && <p className="hint">Carregando…</p>}
+        {sessions && sessions.map(s => <div key={s.id} className="aitoken">
+            <div className="aitoken-name">
+                {s.device || 'Sessão sem identificação'}
+                {s.current && <span className="aitoken-scope" style={{ marginLeft: 8 }}>Esta sessão</span>}
+            </div>
+            <div className="aitoken-meta">conectado desde {fmtDay(s.created_at)}</div>
+            {!s.current && (confirmId === s.id
+                ? <>
+                    <button className="sheetbtn danger" disabled={busy} onClick={() => void closeOne(s.id)}>Confirmar: encerrar este acesso</button>
+                    <button className="sheetbtn ghost" disabled={busy} onClick={() => setConfirmId('')}>Cancelar</button>
+                </>
+                : <button className="sheetbtn" disabled={busy} onClick={() => { setConfirmOthers(false); setConfirmId(s.id); }}>Encerrar</button>)}
+        </div>)}
+        {sessions && others.length > 0 && (confirmOthers
+            ? <>
+                <button className="sheetbtn danger" disabled={busy} onClick={() => void closeOthers()}>Confirmar: encerrar as outras {others.length === 1 ? '(1 sessão)' : `(${others.length} sessões)`}</button>
+                <button className="sheetbtn ghost" disabled={busy} onClick={() => setConfirmOthers(false)}>Cancelar</button>
+            </>
+            : <button className="sheetbtn" disabled={busy} onClick={() => { setConfirmId(''); setConfirmOthers(true); }}>Encerrar as outras sessões</button>)}
+        <p className="hint">Você continua conectado neste aparelho. Sessões antigas, de antes desta versão, aparecem sem identificação até um novo login.</p>
+        <button className="sheetbtn ghost" onClick={onClose}>Fechar</button>
+    </>;
+}
+
 // ---------- Administracao (convites e usuarios; so aparece para o admin) ----------
 interface AdminUser { id: number; username: string; created_at: number; is_admin: boolean; active: boolean }
 interface InviteRow { ref: string; created_at: number; expires_at: number; used_at: number | null; by: string; status: string }
@@ -764,19 +873,12 @@ function StorageMeter({ txs, cats, recs }: { txs: Tx[]; cats: Category[]; recs: 
 }
 export function App() {
     const [txs, setTxs, txsSaved] = useChunkedTxs();
-    // Chaves legadas de versoes antigas do app: o viewer nunca apaga chaves, entao
-    // restos grandes continuam contando na cota de 64 KiB. Gravar null encolhe cada uma.
-    const legA = useLocalState('mf.txs', null as unknown);
-    const legB = useLocalState('mf.txs.v1', null as unknown);
-    const legC = useLocalState('mf.txs.v2', null as unknown);
-    const legD = useLocalState('mf.data', null as unknown);
-    const legE = useLocalState('mf.state', null as unknown);
     const txsRef = useRef<Tx[]>([]);
     txsRef.current = txs;
-    const [cats, setCats, catsSaved] = useLocalState('mf.cats.v1', [] as Category[]);
-    const [recs, setRecs, recsSaved] = useLocalState('mf.recs.v1', SEED_RECS);
-    const [catRules, setCatRules, rulesSaved] = useLocalState('mf.catrules.v1', [] as CatRule[]);
-    const [rulesSeeded, setRulesSeeded] = useLocalState('mf.catrules.seeded.v1', '');
+    const [cats, setCats, catsSaved] = useCol(colKey('mf.cats.v1'), 'cat', [] as Category[]);
+    const [recs, setRecs, recsSaved] = useCol(colKey('mf.recs.v1'), 'rec', SEED_RECS);
+    const [catRules, setCatRules, rulesSaved] = useCol(colKey('mf.catrules.v1'), 'catrule', [] as CatRule[]);
+    const [rulesSeeded, setRulesSeeded] = useLocalState(colKey('mf.catrules.seeded.v1'), '');
     const catRulesRef = useRef<CatRule[]>([]);
     catRulesRef.current = catRules;
     const [recEditing, setRecEditing] = useState<Rec | null>(null);
@@ -784,6 +886,40 @@ export function App() {
     const [recUndoKey, setRecUndoKey] = useState('');
     const [theme, setTheme, themeSaved] = useLocalState('mf.theme.v1', 'light' as 'light' | 'dark');
     const storeReady = !!(txsSaved && txsSaved.ready && catsSaved && catsSaved.ready && themeSaved && themeSaved.ready && recsSaved && recsSaved.ready && rulesSaved && rulesSaved.ready);
+    // Aviso de rejeicao do sync: o pendente NAO e descartado — fica na fila e o
+    // motivo aparece aqui ate o servidor aceitar numa proxima tentativa.
+    const [syncWarn, setSyncWarn] = useState('');
+    useEffect(() => {
+        setSyncWarnHandler((n, first, allTx) => setSyncWarn(n
+            ? n + (allTx
+                ? (n === 1 ? ' lançamento pendente não foi aceito' : ' lançamentos pendentes não foram aceitos')
+                : (n === 1 ? ' item pendente não foi aceito' : ' itens pendentes não foram aceitos'))
+              + (first ? ': ' + first : '') + ' ' + (n === 1 ? 'Ele segue' : 'Eles seguem') + ' guardado' + (n === 1 ? '' : 's') + ' neste aparelho.'
+            : ''));
+        return () => setSyncWarnHandler(null);
+    }, []);
+    // Conflitos: tentativas recusadas como desatualizadas pelo servidor, a
+    // espera de escolha (reaplicar ou descartar). Lidos do armazenamento da
+    // conta quando o app abre (o flush que os gravou recarrega a pagina).
+    const [conflicts, setConflicts] = useState<ConflictItem[]>([]);
+    const [v2conf, setV2conf] = useState<ConflictRecordV2[]>([]);
+    const [v2bloq, setV2bloq] = useState<SyncOpV2[]>([]);
+    const [bloqCorrigindo, setBloqCorrigindo] = useState<SyncOpV2 | null>(null);
+    const [bloqPrefillTx, setBloqPrefillTx] = useState<Tx | null>(null);
+    const [bloqPrefillRec, setBloqPrefillRec] = useState<Rec | null>(null);
+    useEffect(() => { if (storeReady) setConflicts(listConflicts()); }, [storeReady]);
+    useEffect(() => {
+        setConflictsHandler(() => setConflicts(listConflicts()));
+        return () => setConflictsHandler(null);
+    }, []);
+    // Categorias padrao viram categorias de verdade SOB DEMANDA, no momento em
+    // que a pessoa usa (lancamento ou conta fixa): sem flag global por aparelho,
+    // vale por conta, e nunca recria uma categoria que ela apagou de proposito.
+    const ensureCatPersisted = (catId: string) => {
+        if (!catId || cats.some(c => c.id === catId)) return;
+        const def = DEFAULT_CATS.find(d => d.id === catId);
+        if (def) void mergeCats(fresh => [...fresh, def], 'Não foi possível gravar a categoria padrão neste aparelho. O lançamento não depende dela.');
+    };
     const storeMessage = Array.from(new Set([txsSaved && txsSaved.message, catsSaved && catsSaved.message, themeSaved && themeSaved.message, recsSaved && recsSaved.message, rulesSaved && rulesSaved.message].filter(Boolean))).join(' ');
     const now = new Date();
     const [month, setMonth] = useState({ y: now.getFullYear(), m: now.getMonth() });
@@ -791,6 +927,7 @@ export function App() {
     const [editing, setEditing] = useState<Tx | null>(null);
     const [menuOpen, setMenuOpen] = useState(false);
     const [showAIAccess, setShowAIAccess] = useState(false);
+    const [showDevices, setShowDevices] = useState(false);
     const [isAdmin, setIsAdmin] = useState(false);
     const [showAdmin, setShowAdmin] = useState(false);
     useEffect(() => {
@@ -815,6 +952,10 @@ export function App() {
     const [decErr, setDecErr] = useState('');
     const exportTaRef = useRef<HTMLTextAreaElement | null>(null);
     const [notice, setNotice] = useState('');
+    // Aviso do motor (recusa bloqueada, conta trocada): snapshot de string via
+    // useSyncExternalStore — antes a linha lia v2MotorAviso() no corpo e o banner
+    // NUNCA pintava ate outro re-render qualquer (bug real pego na captura).
+    const v2aviso = useSyncExternalStore(v2Subscribe, v2MotorAviso);
     const importInput = useRef<HTMLInputElement>(null);
     const restoreInput = useRef<HTMLInputElement>(null);
 
@@ -906,30 +1047,75 @@ export function App() {
     const persistTxsRef = useRef(persistTxs);
     persistTxsRef.current = persistTxs;
 
-    // Gravacao assincrona falhou (quota/invalid): libera chaves legadas e tenta de novo.
-    const reclaimedRef = useRef(false);
-    useEffect(() => {
-        if (!txsSaved.failed || reclaimedRef.current) return;
-        reclaimedRef.current = true;
-        for (const [val, setLeg] of [legA, legB, legC, legD, legE]) {
-            if (val !== null && val !== undefined) setLeg(null);
-        }
-        const t = setTimeout(() => persistTxsRef.current(txsRef.current), 1500);
-        return () => clearTimeout(t);
-    }, [txsSaved.failed]);
+    // Escrita por intencao (read-merge-write): a mutacao e aplicada sobre a
+    // colecao FRESCA do storage (que pode ter gravacoes de outras abas desde o
+    // render) e o React adota o resultado. A snap recebe o fresco antes da
+    // escrita, entao o diff vira exatamente a intencao — a aba nunca regrava
+    // versao velha de item que outra aba mexeu nem derruba o que nao viu.
+    // Aviso S1 (falha de gravacao LOCAL, discriminada): o formulario segue
+    // aberto com o rascunho intacto; a causa separa limite de armazenamento
+    // das demais falhas. No caminho v1 o aviso sai de persistTxs/setNotice.
+    // S1 do caminho v2 (ensaio): texto HONESTO — a gravacao NAO foi feita e o
+    // rascunho segue no formulario. SEM prometer backup (a exportacao v2 nao
+    // existe neste modo — gap declarado) e SEM anunciar perda definitiva.
+    const avisoGravacao = (r: { ok: boolean; cause?: string | null }): boolean => {
+        if (r.ok) return true;
+        setNotice(r.cause === 'quota'
+            ? 'Sem espaço neste aparelho: a alteração não foi gravada. O rascunho continua no formulário. Libere espaço e tente de novo.'
+            : r.cause === 'closed'
+                ? 'O app foi atualizado em outra aba. Recarregue a página. O rascunho continua no formulário.'
+                : 'Não foi possível gravar agora. A alteração não foi feita. O rascunho continua no formulário.');
+        return false;
+    };
 
-    // Aviso só se continuar falhando depois da limpeza.
-    useEffect(() => {
-        if (!txsSaved.failed || !reclaimedRef.current) return;
-        const t = setTimeout(() => {
-            if (txsSaved.failed) setNotice('Limite de armazenamento atingido. Exporte um backup para não perder dados.');
-        }, 4000);
-        return () => clearTimeout(t);
-    }, [txsSaved.failed]);
+    // Falha AUXILIAR (aprendizado, seed, categoria sob demanda) ganha mensagem
+    // PROPRIA via avisoAux: nunca deixar o aviso generico sugerir que o
+    // registro PRINCIPAL falhou (nem que o auxiliar foi o principal).
+    const avisoOuAux = (ok: boolean, r: { ok: boolean; cause?: string | null }, avisoAux?: string): boolean => {
+        if (ok) return true;
+        if (avisoAux) { setNotice(avisoAux); return false; }
+        return avisoGravacao(r);
+    };
+
+    const mergeTxs = async (fn: (fresh: Tx[]) => Tx[]): Promise<boolean> => {
+        if (v2IsActive()) { const r = await v2Mutate('tx', fn as unknown as (fresh: Record<string, unknown>[]) => Record<string, unknown>[]); return avisoOuAux(r.ok, r); }
+        const fresh = readFreshCollection('tx') as Tx[];
+        const next = fn(fresh);
+        seedSnap('tx', fresh);
+        return persistTxs(next);
+    };
+    const mergeRecs = async (fn: (fresh: Rec[]) => Rec[]): Promise<boolean> => {
+        if (v2IsActive()) { const r = await v2Mutate('rec', fn as unknown as (fresh: Record<string, unknown>[]) => Record<string, unknown>[]); return avisoOuAux(r.ok, r); }
+        const fresh = readFreshCollection('rec') as Rec[];
+        seedSnap('rec', fresh);
+        const ok = setRecs(fn(fresh));
+        if (!ok) setNotice('Limite de armazenamento atingido. Exporte um backup para não perder dados.');
+        return ok;
+    };
+    const mergeCats = async (fn: (fresh: Category[]) => Category[], avisoAux?: string): Promise<boolean> => {
+        if (v2IsActive()) { const r = await v2Mutate('cat', fn as unknown as (fresh: Record<string, unknown>[]) => Record<string, unknown>[]); return avisoOuAux(r.ok, r, avisoAux); }
+        const fresh = readFreshCollection('cat') as Category[];
+        seedSnap('cat', fresh);
+        const ok = setCats(fn(fresh));
+        if (!ok) setNotice(avisoAux ?? 'Limite de armazenamento atingido. Exporte um backup para não perder dados.');
+        return ok;
+    };
+    const mergeCatRules = async (fn: (fresh: CatRule[]) => CatRule[], avisoAux?: string): Promise<boolean> => {
+        if (v2IsActive()) { const r = await v2Mutate('catrule', fn as unknown as (fresh: Record<string, unknown>[]) => Record<string, unknown>[]); return avisoOuAux(r.ok, r, avisoAux); }
+        const fresh = readFreshCollection('catrule') as CatRule[];
+        seedSnap('catrule', fresh);
+        const ok = setCatRules(fn(fresh));
+        if (!ok) setNotice(avisoAux ?? 'Limite de armazenamento atingido. Exporte um backup para não perder dados.');
+        return ok;
+    };
+
+    // Gravacao falhou (quota/invalid): NUNCA apagar chaves legadas para abrir
+    // espaco — dados antigos sem dono ficam preservados. persistTxs ja avisa na hora.
 
     // Regrava o estado resgatado de gravacoes corrompidas (linhas recuperadas, limpo e compacto).
     const salvageRef = useRef(false);
     useEffect(() => {
+        if (v2IsActive()) return; // modo experimental: sem manutencao v1
         if (!txsSaved.ready || !txsSaved.salvage || salvageRef.current) return;
         salvageRef.current = true;
         persistTxsRef.current(txsRef.current);
@@ -938,11 +1124,12 @@ export function App() {
     // Remove duplicatas exatas acumuladas (mantém a mais recente), uma vez por abertura.
     const dedupedRef = useRef(false);
     useEffect(() => {
+        if (v2IsActive()) return; // modo experimental: sem dedupe v1
         if (!txsSaved.ready || dedupedRef.current || txsRef.current.length === 0) return;
         dedupedRef.current = true;
         const seen = new Set<string>();
         let changed = false;
-        const out = txsRef.current.filter(t => {
+        const out = (readFreshCollection('tx') as Tx[]).filter(t => {
             const k = [t.date, t.desc, t.cat, t.cents, t.type, t.recKey ?? ''].join('|');
             if (seen.has(k)) { changed = true; return false; }
             seen.add(k);
@@ -951,16 +1138,230 @@ export function App() {
         if (changed) persistTxsRef.current(out);
     }, [txsSaved.ready]);
 
-    const saveTx = (tx: Tx) => {
-        const exists = txs.some(t => t.id === tx.id);
-        if (!persistTxs(exists ? txs.map(t => (t.id === tx.id ? tx : t)) : [tx, ...txs])) return;
+    // Reaplicar: a tentativa guardada vira uma gravacao nova com a base
+    // CONGELADA na apresentacao do conflito (pinApresentada) — se a oficial
+    // avancou depois, o servidor recusa de novo em vez de sobrescrever o que
+    // ninguem viu. Descartar so encerra a tentativa.
+    const reapplyConflict = async (c: ConflictItem) => {
+        // Reaplicar grava com a base CONGELADA na apresentacao do conflito (a
+        // versao oficial que o usuario VIU ao decidir), nunca o mapa vivo: se a
+        // oficial avancou depois da apresentacao, o servidor recusa de novo em
+        // vez de sobrescrever o que ninguem viu. Legado (server_version -1)
+        // mantem o caminho cego de dois passos: vai sem pin, volta stale com a
+        // versao real, e a reaplicacao seguinte pinna. Recriacao com id NOVO
+        // (tombstone) nao pinna — e create, nao edicao.
+        const pinApresentada = (ent: string) => { if (c.server_version >= 0) pinBase(ent, c.id, c.server_version); };
+        // Se a gravacao local falhar (quota), o pin nao consumido NAO pode
+        // sobrar para a proxima acao do usuario no mesmo item — desfaz.
+        const desfazPin = (ent: string, ok: boolean) => { if (!ok && c.server_version >= 0) unfreezeBase(ent, c.id); };
+        // Sucesso so e anunciado (e a tentativa so sai da lista de
+        // conflitos) quando a colecao E a intencao de envio foram gravadas.
+        // Na falha, a remocao otimista e revertida e a tentativa PERMANECE
+        // na lista — o pin nao consumido tambem e desfeito (desfazPin).
+        let ok = false;
+        if (c.entity === 'tx') {
+            if (c.op === 'delete') { pinApresentada('tx'); ok = pushDelete('tx', c.id); if (ok) ok = await mergeTxs(fresh => fresh.filter(t => t.id !== c.id)); desfazPin('tx', ok); }
+            else if (c.server_deleted) ok = await mergeTxs(fresh => [{ ...(c.data as Tx), id: uid() }, ...fresh]);
+            else { pinApresentada('tx'); ok = await mergeTxs(fresh => [c.data as Tx, ...fresh.filter(t => t.id !== c.id)]); desfazPin('tx', ok); }
+        } else if (c.entity === 'rec') {
+            if (c.op === 'delete') { pinApresentada('rec'); ok = pushDelete('rec', c.id); if (ok) ok = await mergeRecs(fresh => fresh.filter(x => x.id !== c.id)); desfazPin('rec', ok); }
+            else if (c.server_deleted) ok = await mergeRecs(fresh => [...fresh, { ...(c.data as Rec), id: uid() }]);
+            else { pinApresentada('rec'); ok = await mergeRecs(fresh => [...fresh.filter(x => x.id !== c.id), c.data as Rec]); desfazPin('rec', ok); }
+        } else if (c.entity === 'cat') {
+            if (c.op === 'delete') { pinApresentada('cat'); ok = pushDelete('cat', c.id); if (ok) ok = await mergeCats(fresh => fresh.filter(x => x.id !== c.id)); desfazPin('cat', ok); }
+            else if (c.server_deleted) ok = await mergeCats(fresh => [...fresh, { ...(c.data as Category), id: 'c:' + slug((c.data as Category).label) + '-' + uid().slice(0, 6) }]);
+            else { pinApresentada('cat'); ok = await mergeCats(fresh => [...fresh.filter(x => x.id !== c.id), c.data as Category]); desfazPin('cat', ok); }
+        } else if (c.entity === 'catrule') {
+            if (c.op === 'delete') { pinApresentada('catrule'); ok = pushDelete('catrule', c.id); if (ok) ok = await mergeCatRules(fresh => fresh.filter(x => x.key !== c.id)); desfazPin('catrule', ok); }
+            else {
+                // Mesma chave (edicao ou revive de tombstone): a base pinada e a
+                // versao oficial APRESENTADA no conflito — congelada, nunca o
+                // mapa vivo. Legado (-1) vai cego, volta stale com a versao real
+                // e ai o Reaplicar pinna.
+                pinApresentada('catrule');
+                ok = await mergeCatRules(fresh => [c.data as CatRule, ...fresh.filter(x => x.key !== c.id)]);
+                desfazPin('catrule', ok);
+            }
+        }
+        if (!ok) return; // persist* ja avisou a quota; a tentativa permanece na lista
+        dismissConflict(c.entity, c.id);
+        setConflicts(listConflicts());
+        setNotice('Tentativa reaplicada.');
+    };
+    const discardConflict = (c: ConflictItem) => {
+        dismissConflict(c.entity, c.id);
+        setConflicts(listConflicts());
+    };
+    // ---------- conflitos EXPERIMENTAIS v2 (T7/C20 — tentativas separadas) ----------
+    useEffect(() => {
+        if (!v2IsActive()) return;
+        setV2conf(v2Conflicts());
+        return v2Subscribe(() => setV2conf(v2Conflicts()));
+    }, [storeReady]);
+    useEffect(() => {
+        if (!v2IsActive()) return;
+        setV2bloq(v2Bloqueadas());
+        return v2Subscribe(() => setV2bloq(v2Bloqueadas()));
+    }, [storeReady]);
+    const conflitoLabelV2 = (c: ConflictRecordV2): string => {
+        const d = (c.tentativa.data || {}) as { desc?: string; label?: string; key?: string };
+        const tipo = c.entity === 'tx' ? 'lançamento' : c.entity === 'rec' ? 'conta fixa' : c.entity === 'cat' ? 'categoria' : 'sugestão';
+        const nome = d.desc || d.label || d.key || '';
+        return nome ? tipo + ' "' + nome + '"' : tipo;
+    };
+    // Falha na ACAO do conflito: o aviso generico fala de formulario, que aqui
+    // nao existe. A verdade util: a tentativa segue guardada (abort preserva).
+    const reaplicarV2 = async (c: ConflictRecordV2) => {
+        const r = await v2Reaplicar(c);
+        if (r.ok) setNotice('Tentativa reaplicada.');
+        else if (r.cause === 'pendente') setNotice('Há uma alteração tua ainda não sincronizada neste item. Resolve essa edição antes de reaplicar. A tentativa continua guardada.');
+        else if (r.cause === 'closed') avisoGravacao(r);
+        else setNotice('Não foi possível reaplicar agora. A tentativa continua guardada.');
+    };
+    const descartarV2 = async (c: ConflictRecordV2) => {
+        const r = await v2Descartar(c);
+        if (!r.ok && r.cause === 'closed') avisoGravacao(r);
+        else if (!r.ok) setNotice('Não foi possível descartar agora. A tentativa continua guardada.');
+    };
+    // ---------- recusados do motor (rejected, bloqueados) — corrigir/descartar ----------
+    // Semantica JA aprovada: a tentativa FICA preservada ate ACAO EXPLICITA.
+    // Corrigir abre o formulario normal com os dados da tentativa; salvar cria
+    // uma NOVA op pelo caminho normal e descarta a tentativa recusada (mesma
+    // intencao, corrigida). Descartar remove so a tentativa; o oficial fica.
+    const bloqLabel = (o: SyncOpV2): string => {
+        const d = (o.data || {}) as { desc?: string; label?: string; key?: string };
+        const tipo = o.entity === 'tx' ? 'lançamento' : o.entity === 'rec' ? 'conta fixa' : o.entity === 'cat' ? 'categoria' : 'sugestão';
+        const nome = d.desc || d.label || d.key || '';
+        return nome ? tipo + ' "' + nome + '"' : tipo;
+    };
+    const corrigirBloqueada = (o: SyncOpV2) => {
+        v2FreezeBase(o.entity, o.id); // base pin = versao renderizada, como na edicao normal
+        setBloqCorrigindo(o);
+        if (o.entity === 'tx') { setEditing(null); setBloqPrefillTx(o.data as unknown as Tx); setShowForm(true); }
+        else if (o.entity === 'rec') { setRecEditing(null); setBloqPrefillRec(o.data as unknown as Rec); setShowRecForm(true); }
+    };
+    const descartarBloqueada = async (o: SyncOpV2) => {
+        const okD = await v2MotorDescartarBloqueada(o.op_id);
+        if (!okD) setNotice('Não foi possível descartar agora. A tentativa continua guardada.');
+    };
+    // Save da CORRECAO: atomico no syncIDB — guarda de intencao mais nova, op
+    // nova e remocao da recusada na MESMA tx. O pin da base e
+    // consumido pos-commit (E4+token); o unfreeze extra cobre o caso paridade
+    // (sem op nova, nada a consumir) para nunca prender pin estatico.
+    const corrigirSaveTx = async (tx: Tx) => {
+        const alvo = bloqCorrigindo;
+        if (!alvo) return;
+        const r = await v2CorrigirBloqueada(alvo, { ...tx });
+        if (r.ok && r.cause === 'paridade') {
+            // Nada mudou em relacao ao que ja esta na tela: nenhuma op nova e a
+            // tentativa recusada CONTINUA guardada (banner segue visivel).
+            v2UnfreezeBase(alvo.entity, alvo.id);
+            setShowForm(false); setEditing(null); setBloqPrefillTx(null); setBloqCorrigindo(null);
+            setNotice('Você não mudou nada em relação ao que já está na tela. A tentativa recusada continua guardada.');
+        } else if (r.ok) {
+            v2UnfreezeBase(alvo.entity, alvo.id);
+            ensureCatPersisted(tx.cat);
+            learnFromTxs([tx]);
+            setShowForm(false); setEditing(null); setBloqPrefillTx(null); setBloqCorrigindo(null);
+        } else if (r.cause === 'pendente') setNotice('Há uma alteração tua mais nova neste item ainda não sincronizada. Resolve essa edição antes de corrigir. A tentativa recusada continua guardada.');
+        else if (r.cause === 'closed') avisoGravacao(r);
+        else setNotice('Não foi possível corrigir agora. A tentativa continua guardada.');
+    };
+    const corrigirSaveRec = async (r2: Rec) => {
+        const alvo = bloqCorrigindo;
+        if (!alvo) return;
+        const r = await v2CorrigirBloqueada(alvo, { ...r2 });
+        if (r.ok && r.cause === 'paridade') {
+            v2UnfreezeBase(alvo.entity, alvo.id);
+            setShowRecForm(false); setRecEditing(null); setBloqPrefillRec(null); setBloqCorrigindo(null);
+            setNotice('Você não mudou nada em relação ao que já está na tela. A tentativa recusada continua guardada.');
+        } else if (r.ok) {
+            v2UnfreezeBase(alvo.entity, alvo.id);
+            ensureCatPersisted(r2.cat);
+            setShowRecForm(false); setRecEditing(null); setBloqPrefillRec(null); setBloqCorrigindo(null);
+        } else if (r.cause === 'pendente') setNotice('Há uma alteração tua mais nova neste item ainda não sincronizada. Resolve essa edição antes de corrigir. A tentativa recusada continua guardada.');
+        else if (r.cause === 'closed') avisoGravacao(r);
+        else setNotice('Não foi possível corrigir agora. A tentativa continua guardada.');
+    };
+    const fechaFormBloqueada = () => {
+        if (bloqCorrigindo) { v2UnfreezeBase(bloqCorrigindo.entity, bloqCorrigindo.id); setBloqCorrigindo(null); }
+        setBloqPrefillTx(null);
+        setBloqPrefillRec(null);
+    };
+    const conflitoLabel = (c: ConflictItem): string => {
+        const d = (c.data || {}) as { desc?: string; label?: string };
+        const tipo = c.entity === 'tx' ? 'lançamento' : c.entity === 'rec' ? 'conta fixa' : c.entity === 'cat' ? 'categoria' : c.entity === 'catrule' ? 'sugestão' : 'item';
+        const nome = d.desc || d.label || '';
+        const art = c.entity === 'tx' ? 'este' : 'esta';
+        return nome ? tipo + ' "' + nome + '"' : art + ' ' + tipo;
+    };
+    // A decisao Reaplicar/Descartar precisa das DUAS versoes acessiveis e
+    // comparaveis: campos relevantes da tentativa E da oficial — descricao
+    // igual com valor diferente nao pode parecer igual.
+    const detalheDe = (entity: string, d: unknown): string => {
+        if (!d || typeof d !== 'object') return 'sem detalhes';
+        if (entity === 'tx') {
+            const t = d as Tx;
+            const catl = allCats.find(x => x.id === t.cat)?.label || t.cat || '';
+            const dt = String(t.date || '');
+            return '"' + (t.desc || '') + '" (' + fmt(t.cents || 0) + ' · ' + dt.slice(8, 10) + '/' + dt.slice(5, 7) + ' · ' + catl + ')';
+        }
+        if (entity === 'rec') {
+            const r = d as Rec;
+            const catl = allCats.find(x => x.id === r.cat)?.label || r.cat || '';
+            return '"' + (r.desc || '') + '" (' + fmt(r.cents || 0) + ' · dia ' + (r.dueDay || '?') + ' · ' + catl + ')';
+        }
+        if (entity === 'cat') {
+            const c2 = d as Category;
+            return '"' + (c2.label || '') + '" (' + (c2.type || '') + ')';
+        }
+        const r = d as CatRule;
+        return '"' + (r.desc || r.key || '') + '"' + (r.cat ? ' → ' + (allCats.find(x => x.id === r.cat)?.label || r.cat) : '');
+    };
+    // Exclusao nao carrega conteudo na op: identifica o alvo pelo snapshot do
+    // ultimo estado sincronizado (confiavel) ou pelo estado atual; se nada
+    // constar, diz isso — sem inventar nome.
+    const tentativaDetalhe = (c: ConflictItem): string => {
+        if (c.op !== 'delete') return detalheDe(c.entity, c.data);
+        if (c.data && typeof c.data === 'object') return 'apagar ' + detalheDe(c.entity, c.data);
+        const doSnap = snapLookup(c.entity, c.id);
+        if (doSnap) return 'apagar ' + detalheDe(c.entity, doSnap);
+        const cur = c.entity === 'tx' ? txs.find(t => t.id === c.id)
+            : c.entity === 'rec' ? recs.find(r => r.id === c.id)
+            : c.entity === 'cat' ? allCats.find(x => x.id === c.id)
+            : catRules.find(r => r.key === c.id);
+        return cur ? 'apagar ' + detalheDe(c.entity, cur) : 'apagar item sem detalhes disponíveis';
+    };
+    const oficialDetalhe = (c: ConflictItem): string => {
+        if (c.server_deleted) return 'apagada';
+        if (c.server) return detalheDe(c.entity, c.server);
+        // Conflito legado (fila de app antigo): o oficial vem do estado ja hidratado.
+        const cur = c.entity === 'tx' ? txs.find(t => t.id === c.id)
+            : c.entity === 'rec' ? recs.find(r => r.id === c.id)
+            : c.entity === 'cat' ? allCats.find(x => x.id === c.id)
+            : catRules.find(r => r.key === c.id);
+        return cur ? detalheDe(c.entity, cur) : 'não existe mais';
+    };
+
+    const saveTx = async (tx: Tx): Promise<boolean> => {
+        ensureCatPersisted(tx.cat);
+        if (!await mergeTxs(fresh => fresh.some(t => t.id === tx.id) ? fresh.map(t => (t.id === tx.id ? tx : t)) : [tx, ...fresh])) return false;
         learnFromTxs([tx]);
         setShowForm(false);
         setEditing(null);
+        setBloqPrefillTx(null);
+        return true;
     };
 
-    const deleteTx = (id: string) => {
-        persistTxs(txs.filter(t => t.id !== id));
+    const deleteTx = async (id: string) => {
+        // Intencao ANTES da colecao: se a fila nao couber, NADA muda (colecao
+        // e snap intactas) e o formulario fica aberto — ninguem perde dado
+        // por falta de espaco. Se a colecao falhar DEPOIS da intencao gravada,
+        // o item some pelo hydrate do oficial (a op ja esta protegida na fila).
+        // No caminho v2 (ensaio) a exclusao e ATOMICA na transacao do T1:
+        // intencao e estado gravam juntas — nao existe fila v1 para encher.
+        if (!v2IsActive() && !pushDelete('tx', id)) { setNotice('Limite de armazenamento atingido. Exporte um backup para não perder dados.'); return; }
+        if (!await mergeTxs(fresh => fresh.filter(t => t.id !== id))) return;
         setShowForm(false);
         setEditing(null);
         setNotice('Lançamento excluído.');
@@ -968,35 +1369,55 @@ export function App() {
 
     const monthKey = month.y + '-' + String(month.m + 1).padStart(2, '0');
 
-    const payRec = (r: Rec) => {
+    const payRec = async (r: Rec) => {
         const key = r.id + ':' + monthKey;
         if (txs.some(t => t.recKey === key)) return;
         const daysInMonth = new Date(month.y, month.m + 1, 0).getDate();
         const day = Math.min(r.dueDay, daysInMonth);
         const date = monthKey + '-' + String(day).padStart(2, '0');
         const paidTx: Tx = { id: uid(), type: 'despesa', desc: r.desc, cat: r.cat, cents: r.cents, date, recKey: key };
-        if (!persistTxs([paidTx, ...txs])) return;
+        if (!await mergeTxs(fresh => [paidTx, ...fresh])) return;
         learnFromTxs([paidTx]);
         setNotice(r.desc + ' marcada como paga.');
     };
 
-    const unpayRec = (r: Rec) => {
+    const unpayRec = async (r: Rec) => {
         const key = r.id + ':' + monthKey;
         if (recUndoKey !== key) { setRecUndoKey(key); return; }
         setRecUndoKey('');
-        persistTxs(txs.filter(t => t.recKey !== key));
-        setNotice('Pagamento desfeito.');
+        if (v2IsActive()) {
+            // v2 (ensaio): tudo-ou-nada numa unica transacao T1 — ou saem TODOS
+            // os lancamentos gerados ou nenhum; nao existe "saiu metade".
+            const ok = await mergeTxs(fresh => fresh.filter(t => t.recKey !== key));
+            if (ok) setNotice('Pagamento desfeito.');
+            return; // falha: avisoGravacao ja avisou; nada mudou
+        }
+        // Intencao ANTES da colecao: so sai da lista o lancamento cuja
+        // exclusao ficou gravada na fila; o que nao couber PERMANECE — nada
+        // some sem intencao persistida.
+        const gerados = txs.filter(t => t.recKey === key);
+        const enfileirados = gerados.filter(t => pushDelete('tx', t.id));
+        if (enfileirados.length) await mergeTxs(fresh => fresh.filter(t => !enfileirados.some(g => g.id === t.id)));
+        setNotice(enfileirados.length === gerados.length ? 'Pagamento desfeito.' : 'Limite de armazenamento atingido. Exporte um backup para não perder dados.');
     };
 
-    const saveRec = (r: Rec) => {
-        const exists = recs.some(x => x.id === r.id);
-        setRecs(exists ? recs.map(x => (x.id === r.id ? r : x)) : [...recs, r]);
+    const saveRec = async (r: Rec): Promise<boolean> => {
+        ensureCatPersisted(r.cat);
+        // Retorno NUNCA ignorado: se a gravacao falhou, o formulario fica
+        // aberto com o rascunho (avisoGravacao ja avisou a causa).
+        if (!await mergeRecs(fresh => fresh.some(x => x.id === r.id) ? fresh.map(x => (x.id === r.id ? r : x)) : [...fresh, r])) return false;
         setShowRecForm(false);
         setRecEditing(null);
+        setBloqPrefillRec(null);
+        return true;
     };
 
-    const deleteRec = (id: string) => {
-        setRecs(recs.filter(x => x.id !== id));
+    const deleteRec = async (id: string) => {
+        // Mesmo padrao do lancamento: intencao ANTES da colecao; se a fila
+        // nao couber, NADA muda e o formulario fica aberto.
+        // No caminho v2 (ensaio) a exclusao e atomica na transacao do T1.
+        if (!v2IsActive() && !pushDelete('rec', id)) { setNotice('Limite de armazenamento atingido. Exporte um backup para não perder dados.'); return; }
+        if (!await mergeRecs(fresh => fresh.filter(x => x.id !== id))) return;
         setShowRecForm(false);
         setRecEditing(null);
         setNotice('Conta fixa removida. Os lançamentos já feitos continuam no histórico.');
@@ -1005,15 +1426,18 @@ export function App() {
     // Nome repetido (mesmo nome ignorando acento/maiuscula, tipo compativel): avisa e
     // SELECIONA a existente em vez de criar duplicada. O banco recusaria de qualquer
     // jeito (tabela categories); aqui o usuario entende na hora.
-    const addCategory = (label: string, type: TxType) => {
+    // Contrato async: o id so e devolvido DEPOIS do commit. Se a gravacao
+    // falhar, o chamador recebe null e NUNCA fica com referencia a uma
+    // categoria que nao existe (o aviso auxiliar ja saiu dentro do mergeCats).
+    const addCategory = async (label: string, type: TxType): Promise<string | null> => {
         const norm = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
         const clash = allCats.find(c => norm(c.label) === norm(label) && (c.type === type || c.type === 'ambos'));
         if (clash) { setNotice('Você já tem a categoria "' + clash.label + '" — usei ela.'); return clash.id; }
         const id = 'c:' + slug(label);
-        if (!allCats.some(c => c.id === id)) {
-            setCats([...cats, { id, label, icon: '🏷️', color: PALETTE[cats.length % PALETTE.length], type }]);
-        }
-        return id;
+        if (allCats.some(c => c.id === id)) return id;
+        const ok = await mergeCats(fresh => [...fresh, { id, label, icon: '🏷️', color: PALETTE[fresh.length % PALETTE.length], type }],
+            'Não foi possível gravar a nova categoria neste aparelho. Ela não foi usada no lançamento.');
+        return ok ? id : null;
     };
 
     // Aprendizado de categorias: toda gravacao de lancamento vira/atualiza uma
@@ -1027,9 +1451,11 @@ export function App() {
             add.set(t.type + '|' + key, { key, desc: t.desc.trim(), cat: t.cat, type: t.type, at: t.date });
         }
         if (!add.size) return;
-        const merged = catRulesRef.current.filter(r => !add.has(r.type + '|' + r.key));
-        const next = [...add.values(), ...merged].sort((a, b) => b.at.localeCompare(a.at));
-        setCatRules(next.slice(0, 400));
+        // Auxiliar: so roda DEPOIS do principal gravado; a falha diz exatamente isso.
+        void mergeCatRules(fresh => {
+            const merged = fresh.filter(r => !add.has(r.type + '|' + r.key));
+            return [...add.values(), ...merged].sort((a, b) => b.at.localeCompare(a.at)).slice(0, 400);
+        }, 'O lançamento foi gravado, mas a sugestão de categoria não foi gravada.');
     };
 
     // Semeia as associacoes a partir do historico existente (uma vez por aparelho).
@@ -1044,20 +1470,25 @@ export function App() {
             if (!prev || t.date >= prev.at) byKey.set(k, { key, desc: t.desc, cat: t.cat, type: t.type, at: t.date });
         }
         const derived = Array.from(byKey.values()).sort((a, b) => b.at.localeCompare(a.at)).slice(0, 400);
-        if (derived.length && catRulesRef.current.length === 0) setCatRules(derived);
+        if (derived.length) void mergeCatRules(fresh => (fresh.length === 0 ? derived : fresh), 'As sugestões automáticas de categoria não foram gravadas.');
         setRulesSeeded('done');
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [storeReady, rulesSeeded]);
 
-    const saveRule = (rule: CatRule, applyPast: boolean) => {
+    const saveRule = async (rule: CatRule, applyPast: boolean) => {
         const affected = applyPast ? txs.filter(t => t.type === rule.type && normTxt(t.desc) === rule.key && t.cat !== rule.cat) : [];
-        if (affected.length && !persistTxs(txs.map(t => affected.some(a => a.id === t.id) ? { ...t, cat: rule.cat } : t))) return;
-        setCatRules(catRulesRef.current.map(r => (r.key === rule.key && r.type === rule.type) ? rule : r));
+        // Falha de quota aborta ANTES de gravar a regra — anunciar sucesso sem
+        // ter aplicado os lancamentos seria inconsistente.
+        if (affected.length && !await mergeTxs(fresh => fresh.map(t => affected.some(x => x.id === t.id) ? { ...t, cat: rule.cat } : t))) return;
+        if (!await mergeCatRules(fresh => fresh.some(r => r.key === rule.key && r.type === rule.type) ? fresh.map(r => (r.key === rule.key && r.type === rule.type) ? rule : r) : [rule, ...fresh])) return;
         setNotice(affected.length ? 'Sugestão e ' + affected.length + ' ' + (affected.length === 1 ? 'lançamento anterior atualizado.' : 'lançamentos anteriores atualizados.') : 'Sugestão atualizada.');
     };
 
-    const forgetRule = (rule: CatRule) => {
-        setCatRules(catRulesRef.current.filter(r => !(r.key === rule.key && r.type === rule.type)));
+    const forgetRule = async (rule: CatRule) => {
+        // Intencao ANTES da colecao: se a fila nao couber, NADA muda.
+        // No caminho v2 (ensaio) a exclusao e atomica na transacao do T1.
+        if (!v2IsActive() && !pushDelete('catrule', rule.key)) { setNotice('Limite de armazenamento atingido. Exporte um backup para não perder dados.'); return; }
+        if (!await mergeCatRules(fresh => fresh.filter(r => !(r.key === rule.key && r.type === rule.type)))) return;
         setNotice('Sugestão esquecida. As palavras-chave do app ainda podem sugerir uma categoria.');
     };
 
@@ -1185,7 +1616,7 @@ export function App() {
         if (importInput.current) importInput.current.value = '';
     };
 
-    const confirmImport = () => {
+    const confirmImport = async () => {
         if (!preview) return;
         const remap = new Map<string, string>();
         for (const label of preview.catLabels) {
@@ -1201,9 +1632,12 @@ export function App() {
                 newCats.push({ id, label, icon: '🏷️', color: PALETTE[(cats.length + newCats.length) % PALETTE.length], type: 'ambos' });
             }
         }
-        if (!persistTxs([...txs, ...mappedTxs])) return;
+        // Falha de gravacao ABORTA sem falso sucesso: o preview fica aberto e
+        // o aviso S1 ja saiu. (mergeTxs e async desde a camada v2 — await
+        // obrigatorio; sem ele a Promise e sempre truthy = regressao.)
+        if (!await mergeTxs(fresh => [...fresh, ...mappedTxs])) return;
         learnFromTxs(mappedTxs);
-        if (newCats.length) setCats([...cats, ...newCats]);
+        if (newCats.length && !await mergeCats(fresh => [...fresh, ...newCats])) { setNotice(preview.txs.length + ' lançamentos importados, mas as categorias novas NÃO foram gravadas — crie-as de novo.'); setPreview(null); return; }
         setMonth({ y: new Date(mappedTxs[0].date + 'T12:00:00').getFullYear(), m: new Date(mappedTxs[0].date + 'T12:00:00').getMonth() });
         setNotice(preview.txs.length + ' lançamentos importados' + (preview.skipped ? ' (' + preview.skipped + ' duplicados ignorados)' : '') + '.');
         setPreview(null);
@@ -1266,6 +1700,38 @@ export function App() {
                     <button className="iconbtn" aria-label="Menu" onClick={() => setMenuOpen(true)}>⋯</button>
                 </div>
             </header>
+            {v2IsActive() && <div className="syncwarn" role="alert">{v2MotorLigado() ? '🧪 Armazenamento experimental (ensaio): dados fictícios sincronizados com o servidor de teste.' : '🧪 Armazenamento experimental (ensaio): dados só neste aparelho, sincronização desligada.'}</div>}
+            {v2IsActive() && v2aviso && <div className="syncwarn" role="alert">{v2aviso}</div>}
+            {v2IsActive() && v2bloq.map(o => (
+                <div className="syncwarn conflictwarn bloqwarn" role="alert" key={'bloq|' + o.op_id}>
+                    {'⚠️ O servidor recusou tua ' + (o.op === 'delete' ? 'exclusão' : 'alteração') + ' de ' + bloqLabel(o) + '.'}
+                    <span className="cinfo">Motivo: {o.bloqueada}</span>
+                    <span className="cinfo">A tentativa ficou guardada neste aparelho e não será reenviada sozinha.</span>
+                    {o.op !== 'delete' && (o.entity === 'tx' || o.entity === 'rec') && <button className="sheetbtn" onClick={() => corrigirBloqueada(o)}>Corrigir</button>}
+                    <button className="sheetbtn ghost" onClick={() => void descartarBloqueada(o)}>Descartar</button>
+                </div>
+            ))}
+            {syncWarn !== '' && <div className="syncwarn" role="alert">⚠️ {syncWarn}</div>}
+            {conflicts.map(c => (
+                <div className="syncwarn conflictwarn" role="alert" key={c.entity + '|' + c.id}>
+                    {c.server_version === -1
+                        ? <>⚠️ Pendência de antes da atualização do app — tua {c.op === 'delete' ? 'exclusão' : 'alteração'} de {conflitoLabel(c)} ficou guardada.</>
+                        : <>⚠️ Outra tela mudou {conflitoLabel(c)} enquanto tu editavas — tua {c.op === 'delete' ? 'exclusão' : 'alteração'} ficou guardada.</>}
+                    <span className="cinfo">Tua tentativa: {tentativaDetalhe(c)}</span>
+                    <span className="cinfo">Versão oficial: {oficialDetalhe(c)}</span>
+                    <button className="sheetbtn" onClick={() => reapplyConflict(c)}>Reaplicar</button>
+                    <button className="sheetbtn ghost" onClick={() => discardConflict(c)}>Descartar</button>
+                </div>
+            ))}
+            {v2IsActive() && v2conf.map(c => (
+                <div className="syncwarn conflictwarn" role="alert" key={c.entity + '|' + c.id + '|' + c.op_id}>
+                    {'⚠️ Outra escrita venceu ' + conflitoLabelV2(c) + '. Tua ' + (c.tentativa.op === 'delete' ? 'exclusão' : 'alteração') + ' ficou guardada.'}
+                    <span className="cinfo">Tua tentativa: {c.tentativa.op === 'delete' ? 'apagar ' + conflitoLabelV2(c) : detalheDe(c.entity, c.tentativa.data)}</span>
+                    <span className="cinfo">Versão recebida: {c.oficial ? detalheDe(c.entity, c.oficial.data) : 'sem detalhes'}{c.oficial && c.oficial.version != null ? ' · v' + c.oficial.version : ''}{' · '}{new Date(c.ts).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}</span>
+                    <button className="sheetbtn" onClick={() => void reaplicarV2(c)}>Reaplicar</button>
+                    <button className="sheetbtn ghost" onClick={() => void descartarV2(c)}>Descartar</button>
+                </div>
+            ))}
 
             {!storeReady && <div className="empty"><p>Carregando seus dados…</p></div>}
             {storeReady && <>
@@ -1369,7 +1835,7 @@ export function App() {
                     const paid = txs.some(t => t.recKey === key);
                     const undoing = recUndoKey === key;
                     return <div className="recrow" key={r.id}>
-                        <button className="rec-main" onClick={() => { setRecEditing(r); setShowRecForm(true); }}>
+                        <button className="rec-main" onClick={() => { if (v2IsActive()) v2FreezeBase('rec', r.id); else freezeBase('rec', r.id); setRecEditing(r); setShowRecForm(true); }}>
                             <span className="tx-icon" style={{ background: c.color + '22' }}>{c.icon}</span>
                             <span className="tx-main">
                                 <span className="tx-desc">{r.desc}</span>
@@ -1397,7 +1863,7 @@ export function App() {
                         <h3 className="dayhead">{label}</h3>
                         {txs.map(t => {
                             const c = catById(t.cat);
-                            return <button className="tx" key={t.id} onClick={() => { setEditing(t); setShowForm(true); }}>
+                            return <button className="tx" key={t.id} onClick={() => { if (v2IsActive()) v2FreezeBase('tx', t.id); else freezeBase('tx', t.id); setEditing(t); setShowForm(true); }}>
                                 <span className="tx-icon" style={{ background: c.color + '22' }}>{c.icon}</span>
                                 <span className="tx-main">
                                     <span className="tx-desc">{t.desc}</span>
@@ -1423,6 +1889,7 @@ export function App() {
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); restoreInput.current && restoreInput.current.click(); }}>↩️ Restaurar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowInstall(true); }}>📲 Instalar na tela de início</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowAIAccess(true); }}>🤖 Acessos de IA</button>
+                    <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowDevices(true); }}>📱 Aparelhos conectados</button>
                     {isAdmin && <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowAdmin(true); }}>🛡️ Administração</button>}
                     <StorageMeter txs={txs} cats={cats} recs={recs} />
                     <button className="sheetbtn ghost" onClick={() => setMenuOpen(false)}>Fechar</button>
@@ -1432,6 +1899,12 @@ export function App() {
             {showAIAccess && <Overlay onClose={() => setShowAIAccess(false)}>
                 <div className="sheet" onClick={e => e.stopPropagation()}>
                     <AIAccessSheet onClose={() => setShowAIAccess(false)} />
+                </div>
+            </Overlay>}
+
+            {showDevices && <Overlay onClose={() => setShowDevices(false)} className="top">
+                <div className="sheet" onClick={e => e.stopPropagation()}>
+                    <DevicesSheet onClose={() => setShowDevices(false)} />
                 </div>
             </Overlay>}
 
@@ -1523,24 +1996,24 @@ export function App() {
             />}
 
             {showRecForm && <RecForm
-                key={recEditing ? recEditing.id : 'nova'}
-                initial={recEditing}
+                key={recEditing ? recEditing.id : (bloqPrefillRec ? 'bloq|' + bloqPrefillRec.id : 'nova')}
+                initial={recEditing ?? bloqPrefillRec}
                 cats={allCats.filter(c => c.type === 'despesa' || c.type === 'ambos')}
-                onSave={saveRec}
+                onSave={(r) => { if (bloqCorrigindo && bloqCorrigindo.entity === 'rec') void corrigirSaveRec(r); else void saveRec(r); }}
                 onDelete={recEditing ? () => deleteRec(recEditing.id) : null}
                 onAddCategory={addCategory}
-                onClose={() => { setShowRecForm(false); setRecEditing(null); }}
+                onClose={() => { if (recEditing) { if (v2IsActive()) v2UnfreezeBase('rec', recEditing.id); else unfreezeBase('rec', recEditing.id); } fechaFormBloqueada(); setShowRecForm(false); setRecEditing(null); }}
             />}
 
             {showForm && <TxForm
-                key={editing ? editing.id : 'novo'}
-                initial={editing}
+                key={editing ? editing.id : (bloqPrefillTx ? 'bloq|' + bloqPrefillTx.id : 'novo')}
+                initial={editing ?? bloqPrefillTx}
                 cats={allCats}
                 rules={catRules}
-                onSave={saveTx}
+                onSave={(t) => { if (bloqCorrigindo && bloqCorrigindo.entity === 'tx') void corrigirSaveTx(t); else void saveTx(t); }}
                 onDelete={editing ? () => deleteTx(editing.id) : null}
                 onAddCategory={addCategory}
-                onClose={() => { setShowForm(false); setEditing(null); }}
+                onClose={() => { if (editing) { if (v2IsActive()) v2UnfreezeBase('tx', editing.id); else unfreezeBase('tx', editing.id); } fechaFormBloqueada(); setShowForm(false); setEditing(null); }}
             />}
 
             </>}
@@ -1671,7 +2144,7 @@ function TxForm(props: {
     rules: CatRule[];
     onSave: (tx: Tx) => void;
     onDelete: (() => void) | null;
-    onAddCategory: (label: string, type: TxType) => string;
+    onAddCategory: (label: string, type: TxType) => Promise<string | null>;
     onClose: () => void;
 }) {
     const { initial } = props;
@@ -1732,7 +2205,7 @@ function TxForm(props: {
                 {!cat && suggested && <p className="hint">Categoria sugerida pela descrição — toque em outra para mudar.</p>}
                 <div className="newcat">
                     <input type="text" placeholder="Nova categoria…" value={novaCat} onChange={e => setNovaCat(e.target.value)} />
-                    <button className="chip" disabled={!novaCat.trim()} onClick={() => { const id = props.onAddCategory(novaCat.trim(), type); setCat(id); setCatTouched(true); setNovaCat(''); }}>Adicionar</button>
+                    <button className="chip" disabled={!novaCat.trim()} onClick={() => { void props.onAddCategory(novaCat.trim(), type).then(id => { if (id) { setCat(id); setCatTouched(true); setNovaCat(''); } }); }}>Adicionar</button>
                 </div>
             </div>
             <label className="field">
@@ -1757,7 +2230,7 @@ function RecForm(props: {
     cats: Category[];
     onSave: (r: Rec) => void;
     onDelete: (() => void) | null;
-    onAddCategory: (label: string, type: TxType) => string;
+    onAddCategory: (label: string, type: TxType) => Promise<string | null>;
     onClose: () => void;
 }) {
     const { initial } = props;
@@ -1804,7 +2277,7 @@ function RecForm(props: {
                 </div>
                 <div className="newcat">
                     <input type="text" placeholder="Nova categoria…" value={novaCat} onChange={e => setNovaCat(e.target.value)} />
-                    <button className="chip" disabled={!novaCat.trim()} onClick={() => { const id = props.onAddCategory(novaCat.trim(), 'despesa'); setCat(id); setNovaCat(''); }}>Adicionar</button>
+                    <button className="chip" disabled={!novaCat.trim()} onClick={() => { void props.onAddCategory(novaCat.trim(), 'despesa').then(id => { if (id) { setCat(id); setNovaCat(''); } }); }}>Adicionar</button>
                 </div>
             </div>
             {err && <p className="error">{err}</p>}
