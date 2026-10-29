@@ -1,3 +1,4 @@
+import {storage} from './accountStorage';
 import { useState } from 'react';
 import { notifyChange } from './sync';
 
@@ -13,7 +14,7 @@ export interface LocalStateMeta {
 export function useLocalState<T>(key: string, initial: T): [T, (v: T) => boolean, LocalStateMeta] {
     const [value, setValue] = useState<T>(() => {
         try {
-            const raw = window.localStorage.getItem(key);
+            const raw = storage.getItem(key);
             if (raw != null) return JSON.parse(raw) as T;
         } catch {
             // sem acesso ao armazenamento: usa o valor inicial em memória
@@ -24,9 +25,9 @@ export function useLocalState<T>(key: string, initial: T): [T, (v: T) => boolean
     // Retorna false quando a gravação não persistiu (sem espaço ou acesso bloqueado),
     // para quem chama decidir se tenta de novo ou avisa. O estado em memória sempre atualiza.
     const set = (v: T): boolean => {
-        setValue(v);
         try {
-            window.localStorage.setItem(key, JSON.stringify(v));
+            storage.setItem(key, JSON.stringify(v));
+            setValue(v);
             notifyChange(key); // enfileira a mudanca para o sync com a VM
             return true;
         } catch {

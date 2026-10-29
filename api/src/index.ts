@@ -340,14 +340,109 @@ function passwordIssues(pw: unknown): string | null {
     return null;
 }
 
+// Migracao v7: sessoes ganham public_id — identificador publico aleatorio, NAO
+// derivado do token, para a tela "Aparelhos conectados" referenciar qual sessao
+// encerrar sem expor nenhuma parte do segredo. ADITIVA: so acrescenta a coluna
+// e sorteia ids para as sessoes que ja existem; nada e apagado.
+function migrateSessionIdsIfNeeded(): void {
+    const v = db.prepare("SELECT v FROM meta WHERE k = 'schema_v'").get() as any;
+    if (!v || Number(v.v) < 7) {
+        const cols = db.prepare('PRAGMA table_info(sessions)').all() as any[];
+        if (!cols.some(c => c.name === 'public_id')) {
+            db.exec("ALTER TABLE sessions ADD COLUMN public_id TEXT NOT NULL DEFAULT ''");
+        }
+    // Parcial: sessoes gravadas por codigo antigo (rollback) ficam com '' e NAO
+    // colidem entre si; so ids preenchidos precisam ser unicos.
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS sessions_public_id_uniq ON sessions(public_id) WHERE public_id <> ''");
+        db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_v', '7')").run();
+        console.log('migracao v7 (sessions.public_id) aplicada');
+    }
+    // Fora do portao de versao, de proposito: sessao gravada por codigo ANTIGO
+    // durante um rollback (public_id = '') recebe um id em qualquer subida do
+    // codigo novo. UPDATE barato e vazio no caminho normal.
+    db.prepare("UPDATE sessions SET public_id = lower(hex(randomblob(16))) WHERE public_id = ''").run();
+}
+migrateSessionIdsIfNeeded();
+
+
+// Scoped protocol tables, separate from dev schema numbers.
+db.exec(`CREATE TABLE IF NOT EXISTS protected_versions(owner INTEGER NOT NULL,entity TEXT NOT NULL,id TEXT NOT NULL,version INTEGER NOT NULL,PRIMARY KEY(owner,entity,id));
+CREATE TABLE IF NOT EXISTS protected_receipts(owner INTEGER NOT NULL,op_id TEXT NOT NULL,payload TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(owner,op_id));`);
+
+db.exec(`CREATE TRIGGER IF NOT EXISTS protected_history_version AFTER INSERT ON history WHEN NEW.entity IN ('tx','cat','rec','catrule') BEGIN
+INSERT INTO protected_versions(owner,entity,id,version) VALUES(NEW.owner,NEW.entity,NEW.rid,2) ON CONFLICT(owner,entity,id) DO UPDATE SET version=version+1;
+END;`);
+const PAST_DEFAULT_CATS = [
+    { id: 'alimentacao', label: 'Alimentação', icon: '🍽️', color: '#c96a3a', type: 'despesa' },
+    { id: 'casa', label: 'Casa', icon: '🏠', color: '#a0795a', type: 'despesa' },
+    { id: 'contas', label: 'Contas', icon: '🧾', color: '#5b6abf', type: 'despesa' },
+    { id: 'educacao', label: 'Educação', icon: '📚', color: '#3aa6a0', type: 'despesa' },
+    { id: 'lazer', label: 'Lazer', icon: '🎮', color: '#8a6bbf', type: 'despesa' },
+    { id: 'saude', label: 'Saúde', icon: '💊', color: '#d1567f', type: 'despesa' },
+    { id: 'supermercado', label: 'Supermercado', icon: '🛒', color: '#5b9e4d', type: 'despesa' },
+    { id: 'transporte', label: 'Transporte', icon: '🚗', color: '#4a7fbf', type: 'despesa' },
+    { id: 'vestuario', label: 'Vestuário', icon: '👕', color: '#b06ad4', type: 'despesa' },
+    { id: 'viagem', label: 'Viagem', icon: '✈️', color: '#3f9fd8', type: 'despesa' },
+    { id: 'outros-d', label: 'Outros', icon: '📦', color: '#8a8a8a', type: 'despesa' },
+    { id: 'salario', label: 'Salário', icon: '💼', color: '#2e9e6b', type: 'receita' },
+    { id: 'freelance', label: 'Freelance', icon: '💻', color: '#3f8fbf', type: 'receita' },
+    { id: 'investimentos', label: 'Investimentos', icon: '📈', color: '#4cae4f', type: 'receita' },
+    { id: 'presente', label: 'Presente', icon: '🎁', color: '#d4709a', type: 'receita' },
+    { id: 'outros-r', label: 'Outros', icon: '➕', color: '#8a8a8a', type: 'receita' },
+];
+function canonical(v:any):string{return JSON.stringify(v,(_k,x)=>x&&typeof x==='object'&&!Array.isArray(x)?Object.fromEntries(Object.keys(x).sort().map(k=>[k,x[k]])):x)}
+function currentVersion(owner:number,entity:string,id:string):number{
+ const table=({tx:'transactions',cat:'categories',rec:'recs',catrule:'catrules'} as Record<string,string>)[entity];
+ if(!table)return 0;
+ const column=entity==='catrule'?'rule_key':'id';
+ const exists=db.prepare('SELECT 1 FROM '+table+' WHERE owner=? AND '+column+'=?').get(owner,id);
+ if(!exists)return 0;
+ return (db.prepare('SELECT version FROM protected_versions WHERE owner=? AND entity=? AND id=?').get(owner,entity,id) as any)?.version||1;
+}
+db.exec(`CREATE TABLE IF NOT EXISTS protected_past_receipts(owner INTEGER NOT NULL,action_id TEXT NOT NULL,payload TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(owner,action_id));`);
 // ---------- sessoes ----------
 const sha256 = (s: string) => crypto.createHash('sha256').update(s).digest('hex');
-function createSession(device: string, userId: number): { token: string; expires: number } {
+function uaLabel(ua: string): string {
+    const s = String(ua || '');
+    let os = '';
+    if (/iPhone/.test(s)) os = 'iPhone';
+    else if (/iPad/.test(s)) os = 'iPad';
+    else if (/Android/.test(s)) os = 'Android';
+    else if (/Windows/.test(s)) os = 'Windows';
+    else if (/Mac OS X/.test(s)) os = 'Mac';
+    else if (/Linux/.test(s)) os = 'Linux';
+    let br = '';
+    if (/Edg\//.test(s)) br = 'Edge';
+    else if (/Firefox\//.test(s)) br = 'Firefox';
+    else if (/Chrome\//.test(s)) br = 'Chrome';
+    else if (/Safari\//.test(s)) br = 'Safari';
+    if (br && os) return br + ' no ' + os;
+    if (br) return br;
+    if (os) return 'Navegador no ' + os;
+    return 'Navegador não identificado';
+}
+
+function createSession(device: string, userId: number, ua: string): { token: string; expires: number } {
     const token = crypto.randomBytes(32).toString('base64url');
     const now = Date.now();
-    db.prepare('INSERT INTO sessions (token_hash, created_at, expires_at, device, user_id) VALUES (?,?,?,?,?)')
-        .run(sha256(token), now, now + SESSION_TTL_MS, device.slice(0, 80), userId);
-    return { token, expires: now + SESSION_TTL_MS };
+    // Precedencia do rotulo: User-Agent ("Safari no iPhone") quando identificado;
+    // senao o rotulo simples que o app envia ("iPhone", "Computador"); senao fica
+    // explicito que nao deu pra identificar. O app tambem manda o rotulo dele no
+    // corpo do sync (para o historico) — isso nao muda.
+    const fromUa = uaLabel(ua);
+    const label = (fromUa !== 'Navegador não identificado' ? fromUa : (device || fromUa)).slice(0, 80);
+    const ins = db.prepare('INSERT INTO sessions (token_hash, public_id, created_at, expires_at, device, user_id) VALUES (?,?,?,?,?,?)');
+    // public_id aleatorio (128 bits): sem relacao com o token; na colisao
+    // improvavel, sorteia outro — depois disso desiste e sobe o erro.
+    for (let i = 0; i < 3; i++) {
+        try {
+            ins.run(sha256(token), crypto.randomBytes(16).toString('hex'), now, now + SESSION_TTL_MS, label, userId);
+            return { token, expires: now + SESSION_TTL_MS };
+        } catch (e: any) {
+            if (i === 2 || !String(e?.message || '').includes('UNIQUE')) throw e;
+        }
+    }
+    throw new Error('nao foi possivel criar a sessao');
 }
 function sessionFromCookie(req: http.IncomingMessage): { token: string; device: string; userId: number; username: string; isAdmin: boolean } | null {
     const raw = req.headers.cookie || '';
@@ -482,13 +577,13 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
         // so de lancamentos (ordem identica), entao reordenar aqui e seguro.
         const ordered = [...list].sort((a, b) => (a?.entity === 'cat' ? 0 : 1) - (b?.entity === 'cat' ? 0 : 1));
         for (const o of ordered) {
-            if (!ENTITIES.has(o.entity) || typeof o.id !== 'string' || !o.id || o.id.length > 120) { results.push({ id: o?.id, status: 'invalid' }); continue; }
+            if (!ENTITIES.has(o.entity) || typeof o.id !== 'string' || !o.id || o.id.length > 120) { results.push({ entity:o.entity, id: o?.id, status: 'invalid' }); continue; }
             const ts = Number(o.ts) > 0 ? Math.min(Number(o.ts), Date.now() + 5 * 60 * 1000) : Date.now();
             // --- categorias vivem na tabela categories (unicidade garantida pelo banco) ---
             if (o.entity === 'cat') {
                 const curCat = db.prepare('SELECT updated_at, deleted, label, icon, color, type FROM categories WHERE owner = ? AND id = ?').get(userId, o.id) as any;
                 if (curCat && curCat.updated_at > ts) {
-                    results.push({ id: o.id, status: 'skipped', server: curCat.deleted ? null : { id: o.id, label: curCat.label, icon: curCat.icon, color: curCat.color, type: curCat.type }, deleted: !!curCat.deleted, updated_at: curCat.updated_at });
+                    results.push({ entity:o.entity, id: o.id, status: 'skipped', server: curCat.deleted ? null : { id: o.id, label: curCat.label, icon: curCat.icon, color: curCat.color, type: curCat.type }, deleted: !!curCat.deleted, updated_at: curCat.updated_at });
                     continue;
                 }
                 const catJson = (c: any) => JSON.stringify({ id: o.id, label: c.label, icon: c.icon, color: c.color, type: c.type });
@@ -498,24 +593,24 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                         addHist.run(Date.now(), device, 'cat', o.id, 'delete', catJson(curCat), null, userId);
                         applied++;
                     }
-                    results.push({ id: o.id, status: 'applied' });
+                    results.push({ entity:o.entity, id: o.id, status: 'applied' });
                     continue;
                 }
-                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ entity:o.entity, id: o.id, status: 'invalid' }); continue; }
                 const d = o.data as any;
                 const label = String(d.label || '').trim().slice(0, 60);
-                if (!label) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (!label) { results.push({ entity:o.entity, id: o.id, status: 'invalid' }); continue; }
                 const type = d.type === 'despesa' || d.type === 'receita' ? d.type : 'ambos';
                 const norm = normLabel(label);
                 // nome repetido (mesmo dono e tipo, outro id): o banco recusaria; avisamos bonito antes
                 const clash = db.prepare('SELECT id, label FROM categories WHERE owner = ? AND type = ? AND norm_label = ? AND deleted = 0 AND id != ?').get(userId, type, norm, o.id) as any;
-                if (clash) { results.push({ id: o.id, status: 'rejected', error: 'Você já tem a categoria "' + clash.label + '".' }); continue; }
+                if (clash) { results.push({ entity:o.entity, id: o.id, status: 'rejected', error: 'Você já tem a categoria "' + clash.label + '".' }); continue; }
                 db.prepare(`INSERT INTO categories (owner, id, label, norm_label, icon, color, type, updated_at, deleted) VALUES (?,?,?,?,?,?,?,?,0)
                     ON CONFLICT(owner, id) DO UPDATE SET label=excluded.label, norm_label=excluded.norm_label, icon=excluded.icon, color=excluded.color, type=excluded.type, updated_at=excluded.updated_at, deleted=0`)
                     .run(userId, o.id, label, norm, String(d.icon || '🏷️'), String(d.color || ''), type, ts);
                 const after = JSON.stringify({ id: o.id, label, icon: String(d.icon || '🏷️'), color: String(d.color || ''), type });
                 addHist.run(Date.now(), device, 'cat', o.id, curCat && !curCat.deleted ? 'update' : 'create', curCat && !curCat.deleted ? catJson(curCat) : null, after, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; results.push({ entity:o.entity, id: o.id, status: 'applied' });
                 continue;
             }
             // --- contas fixas vivem na tabela recs (v5): mesmas regras dos lancamentos ---
@@ -523,7 +618,7 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                 const curRec = db.prepare('SELECT description, cat, cents, due_day, updated_at, deleted FROM recs WHERE owner = ? AND id = ?').get(userId, o.id) as any;
                 const recJson = (r: any) => JSON.stringify({ id: o.id, desc: r.description, cat: r.cat, cents: r.cents, dueDay: r.due_day });
                 if (curRec && curRec.updated_at > ts) {
-                    results.push({ id: o.id, status: 'skipped', server: curRec.deleted ? null : JSON.parse(recJson(curRec)), deleted: !!curRec.deleted, updated_at: curRec.updated_at });
+                    results.push({ entity:o.entity, id: o.id, status: 'skipped', server: curRec.deleted ? null : JSON.parse(recJson(curRec)), deleted: !!curRec.deleted, updated_at: curRec.updated_at });
                     continue; // ultima edicao vence: a do servidor e mais nova
                 }
                 if (o.op === 'delete') {
@@ -532,15 +627,15 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                         addHist.run(Date.now(), device, 'rec', o.id, 'delete', recJson(curRec), null, userId);
                         applied++;
                     }
-                    results.push({ id: o.id, status: 'applied' });
+                    results.push({ entity:o.entity, id: o.id, status: 'applied' });
                     continue;
                 }
-                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ entity:o.entity, id: o.id, status: 'invalid' }); continue; }
                 const d = o.data as any;
-                if (d.id !== o.id || !validNewRec(d)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (d.id !== o.id || !validNewRec(d)) { results.push({ entity:o.entity, id: o.id, status: 'invalid' }); continue; }
                 // a categoria precisa existir (chave estrangeira): avisa bonito em vez de estourar o lote
                 if (!db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?').get(userId, String(d.cat))) {
-                    results.push({ id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
+                    results.push({ entity:o.entity, id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
                     continue;
                 }
                 const desc = capFirst(String(d.desc));
@@ -549,7 +644,7 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                     .run(userId, o.id, desc, String(d.cat), d.cents, d.dueDay, ts);
                 const after = JSON.stringify({ id: o.id, desc, cat: String(d.cat), cents: d.cents, dueDay: d.dueDay });
                 addHist.run(Date.now(), device, 'rec', o.id, curRec && !curRec.deleted ? 'update' : 'create', curRec && !curRec.deleted ? recJson(curRec) : null, after, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; results.push({ entity:o.entity, id: o.id, status: 'applied' });
                 continue;
             }
             // --- sugestoes de categoria vivem na tabela catrules (v6): mesmas regras ---
@@ -557,7 +652,7 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                 const curRule = db.prepare('SELECT rule_key, description, cat, type, at, updated_at, deleted FROM catrules WHERE owner = ? AND rule_key = ?').get(userId, o.id) as any;
                 const ruleJson = (r: any) => JSON.stringify({ key: o.id, desc: r.description, cat: r.cat, type: r.type, at: r.at });
                 if (curRule && curRule.updated_at > ts) {
-                    results.push({ id: o.id, status: 'skipped', server: curRule.deleted ? null : JSON.parse(ruleJson(curRule)), deleted: !!curRule.deleted, updated_at: curRule.updated_at });
+                    results.push({ entity:o.entity, id: o.id, status: 'skipped', server: curRule.deleted ? null : JSON.parse(ruleJson(curRule)), deleted: !!curRule.deleted, updated_at: curRule.updated_at });
                     continue; // ultima edicao vence: a do servidor e mais nova
                 }
                 if (o.op === 'delete') {
@@ -566,15 +661,15 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                         addHist.run(Date.now(), device, 'catrule', o.id, 'delete', ruleJson(curRule), null, userId);
                         applied++;
                     }
-                    results.push({ id: o.id, status: 'applied' });
+                    results.push({ entity:o.entity, id: o.id, status: 'applied' });
                     continue;
                 }
-                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ entity:o.entity, id: o.id, status: 'invalid' }); continue; }
                 const d = o.data as any;
-                if (d.key !== o.id || !validNewCatrule(d)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (d.key !== o.id || !validNewCatrule(d)) { results.push({ entity:o.entity, id: o.id, status: 'invalid' }); continue; }
                 // a categoria precisa existir (chave estrangeira): avisa bonito em vez de estourar o lote
                 if (!db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?').get(userId, String(d.cat))) {
-                    results.push({ id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
+                    results.push({ entity:o.entity, id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
                     continue;
                 }
                 const desc = capFirst(String(d.desc));
@@ -583,7 +678,7 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                     .run(userId, o.id, desc, String(d.cat), String(d.type), String(d.at), ts);
                 const after = JSON.stringify({ key: o.id, desc, cat: String(d.cat), type: String(d.type), at: String(d.at) });
                 addHist.run(Date.now(), device, 'catrule', o.id, curRule && !curRule.deleted ? 'update' : 'create', curRule && !curRule.deleted ? ruleJson(curRule) : null, after, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; results.push({ entity:o.entity, id: o.id, status: 'applied' });
                 continue;
             }
             // --- lancamentos vivem na tabela transactions (v4): colunas de verdade, categoria com chave estrangeira ---
@@ -591,7 +686,7 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                 const curTx = db.prepare('SELECT date, description, cat, cents, type, rec_key, fitid, updated_at, deleted FROM transactions WHERE owner = ? AND id = ?').get(userId, o.id) as any;
                 const txJson = (t: any) => JSON.stringify({ id: o.id, date: t.date, desc: t.description, cat: t.cat, cents: t.cents, type: t.type, ...(t.rec_key ? { recKey: t.rec_key } : {}), ...(t.fitid ? { fitid: t.fitid } : {}) });
                 if (curTx && curTx.updated_at > ts) {
-                    results.push({ id: o.id, status: 'skipped', server: curTx.deleted ? null : JSON.parse(txJson(curTx)), deleted: !!curTx.deleted, updated_at: curTx.updated_at });
+                    results.push({ entity:o.entity, id: o.id, status: 'skipped', server: curTx.deleted ? null : JSON.parse(txJson(curTx)), deleted: !!curTx.deleted, updated_at: curTx.updated_at });
                     continue; // ultima edicao vence: a do servidor e mais nova
                 }
                 if (o.op === 'delete') {
@@ -600,15 +695,15 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                         addHist.run(Date.now(), device, 'tx', o.id, 'delete', txJson(curTx), null, userId);
                         applied++;
                     }
-                    results.push({ id: o.id, status: 'applied' });
+                    results.push({ entity:o.entity, id: o.id, status: 'applied' });
                     continue;
                 }
-                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (o.op !== 'upsert' || o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ entity:o.entity, id: o.id, status: 'invalid' }); continue; }
                 const d = o.data as any;
-                if (d.id !== o.id || !validNewTx(d)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (d.id !== o.id || !validNewTx(d)) { results.push({ entity:o.entity, id: o.id, status: 'invalid' }); continue; }
                 // a categoria precisa existir (chave estrangeira): avisa bonito em vez de estourar o lote
                 if (!db.prepare('SELECT 1 FROM categories WHERE owner = ? AND id = ?').get(userId, String(d.cat))) {
-                    results.push({ id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
+                    results.push({ entity:o.entity, id: o.id, status: 'rejected', error: 'Categoria não encontrada.' });
                     continue;
                 }
                 const desc = capFirst(String(d.desc));
@@ -619,29 +714,29 @@ function applyOps(device: string, userId: number, ops: SyncOp[]): { applied: num
                     .run(userId, o.id, String(d.date), desc, String(d.cat), d.cents, d.type, recKey, fitid, ts);
                 const after = JSON.stringify({ id: o.id, date: String(d.date), desc, cat: String(d.cat), cents: d.cents, type: d.type, ...(recKey ? { recKey } : {}), ...(fitid ? { fitid } : {}) });
                 addHist.run(Date.now(), device, 'tx', o.id, curTx && !curTx.deleted ? 'update' : 'create', curTx && !curTx.deleted ? txJson(curTx) : null, after, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; results.push({ entity:o.entity, id: o.id, status: 'applied' });
                 continue;
             }
             const cur = getRec.get(o.entity, o.id, userId) as any;
             if (cur && cur.updated_at > ts) {
-                results.push({ id: o.id, status: 'skipped', server: cur.deleted ? null : JSON.parse(cur.data), deleted: !!cur.deleted, updated_at: cur.updated_at });
+                results.push({ entity:o.entity, id: o.id, status: 'skipped', server: cur.deleted ? null : JSON.parse(cur.data), deleted: !!cur.deleted, updated_at: cur.updated_at });
                 continue; // ultima edicao vence: a do servidor e mais nova
             }
             const before = cur && !cur.deleted ? cur.data : null;
             if (o.op === 'delete') {
-                if (!cur || cur.deleted) { results.push({ id: o.id, status: 'applied' }); continue; }
+                if (!cur || cur.deleted) { results.push({ entity:o.entity, id: o.id, status: 'applied' }); continue; }
                 upRec.run({ entity: o.entity, id: o.id, owner: userId, updated_at: ts, deleted: 1, data: cur.data });
                 addHist.run(Date.now(), device, o.entity, o.id, 'delete', before, null, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; results.push({ entity:o.entity, id: o.id, status: 'applied' });
             } else if (o.op === 'upsert') {
-                if (o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (o.data === null || typeof o.data !== 'object' || Array.isArray(o.data)) { results.push({ entity:o.entity, id: o.id, status: 'invalid' }); continue; }
                 const data = JSON.stringify(o.data);
-                if (data.length > 200000) { results.push({ id: o.id, status: 'invalid' }); continue; }
+                if (data.length > 200000) { results.push({ entity:o.entity, id: o.id, status: 'invalid' }); continue; }
                 upRec.run({ entity: o.entity, id: o.id, owner: userId, updated_at: ts, deleted: 0, data });
                 addHist.run(Date.now(), device, o.entity, o.id, cur && !cur.deleted ? 'update' : 'create', before, data, userId);
-                applied++; results.push({ id: o.id, status: 'applied' });
+                applied++; results.push({ entity:o.entity, id: o.id, status: 'applied' });
             } else {
-                results.push({ id: o.id, status: 'invalid' });
+                results.push({ entity:o.entity, id: o.id, status: 'invalid' });
             }
         }
     });
@@ -656,6 +751,11 @@ const server = http.createServer(async (req, res) => {
         const p = url.pathname;
         if (req.method === 'GET' && p === '/api/health') return send(res, 200, { ok: true, ts: Date.now() });
 
+        const securityMutation = req.method === 'POST' && ['/api/auth/password','/api/sessions/close','/api/sessions/close-others'].includes(p);
+        if (securityMutation) {
+            const expected = APP_URL || '';
+            if (!expected || req.headers.origin !== new URL(expected).origin || req.headers['x-dindin-action'] !== 'security') return send(res,403,{error:'Origem da ação não confirmada.'});
+        }
         const sess = sessionFromCookie(req);
 
         if (req.method === 'GET' && p === '/api/auth/status') {
@@ -675,7 +775,7 @@ const server = http.createServer(async (req, res) => {
             if (body.password !== body.confirm) return send(res, 400, { error: 'As duas senhas não conferem.' });
             db.prepare('INSERT INTO users (id, username, pass_hash, created_at, is_admin, active) VALUES (1, ?, ?, ?, 1, 1)').run(user, hashPassword(body.password), Date.now());
             const device = String(body.device || '').slice(0, 80);
-            const s = createSession(device, 1);
+            const s = createSession(device, 1, String(req.headers['user-agent'] || ''));
             return send(res, 200, { ok: true }, { 'set-cookie': cookieHeader(s.token, SESSION_TTL_MS / 1000) });
         }
 
@@ -689,7 +789,7 @@ const server = http.createServer(async (req, res) => {
             if (!row || !row.active || !ok) { noteFail(key); return send(res, 401, { error: 'Usuário ou senha incorretos.' }); } // desativado: mesmo erro generico, sem revelar
             clearFails(key);
             const device = String(body.device || '').slice(0, 80);
-            const s = createSession(device, row.id);
+            const s = createSession(device, row.id, String(req.headers['user-agent'] || ''));
             return send(res, 200, { ok: true }, { 'set-cookie': cookieHeader(s.token, SESSION_TTL_MS / 1000) });
         }
 
@@ -723,7 +823,7 @@ const server = http.createServer(async (req, res) => {
             if (newId === 'invite') return send(res, 401, { error: 'Convite inválido ou vencido.' }); // generico: nao distingue inexistente/usado/vencido
             if (newId === 'taken') return send(res, 409, { error: 'Esse nome de usuário já está em uso.' });
             const device = String(body.device || '').slice(0, 80);
-            const s = createSession(device, newId);
+            const s = createSession(device, newId, String(req.headers['user-agent'] || ''));
             return send(res, 200, { ok: true }, { 'set-cookie': cookieHeader(s.token, SESSION_TTL_MS / 1000) });
         }
 
@@ -804,11 +904,103 @@ const server = http.createServer(async (req, res) => {
             // sugestoes de categoria vem da tabela (fonte da verdade), no mesmo formato JSON que o app espera
             const ruleRows = db.prepare('SELECT rule_key, description, cat, type, at FROM catrules WHERE owner = ? AND deleted = 0').all(auth.userId) as any[];
             for (const r of ruleRows) out['catrule'].push({ key: r.rule_key, desc: r.description, cat: r.cat, type: r.type, at: r.at });
-            return send(res, 200, { serverTime: Date.now(), records: out });
+            const versions:Record<string,number>={};
+            for(const [entity,table]of Object.entries({tx:'transactions',cat:'categories',rec:'recs',catrule:'catrules'})){
+                const col=entity==='catrule'?'rule_key':'id';
+                for(const row of db.prepare('SELECT '+col+' AS id FROM '+table+' WHERE owner=?').all(auth.userId) as any[])versions[entity+':'+row.id]=currentVersion(auth.userId,entity,row.id);
+            }
+            return send(res,200,{serverTime:Date.now(),username:sess?.username,records:out,versions});
+        }
+
+
+        // Only the explicit apply-category-to-past action is an atomic group.
+        if(req.method==='GET'&&p.startsWith('/api/past-actions/')){
+            if(auth.kind!=='session'||!sess)return send(res,403,{error:'Use o app.'});
+            const row=db.prepare('SELECT payload,result FROM protected_past_receipts WHERE owner=? AND action_id=?').get(auth.userId,p.slice('/api/past-actions/'.length)) as any;
+            return send(res,200,{username:sess.username,receipt:!!row,...(row?{action:JSON.parse(row.payload),result:JSON.parse(row.result)}:{})});
+        }
+        if(req.method==='POST'&&p==='/api/past-actions'){
+            if(auth.kind!=='session'||!sess)return send(res,403,{error:'Use o app.'});
+            const body=await readBody(req),action=body.action;
+            if(req.headers['x-dindin-client']!=='protected-v1'||body.username!==sess.username)return send(res,409,{error:'Confira a conta.'});
+            if(!action||typeof action.action_id!=='string'||action.action_id.length<8||action.action_id.length>128||typeof action.key!=='string'||!['despesa','receita'].includes(action.type)||typeof action.cat!=='string'||!Array.isArray(action.matches)||!Array.isArray(action.ops)||!action.ops.length||action.ops.length>2000||action.ops.some((o:any)=>o.owner!==sess.username||typeof o.op_id!=='string'||!Number.isInteger(o.base_version)||o.op!=='upsert'||!['tx','cat','catrule'].includes(o.entity)))return send(res,400,{error:'Ação inválida.'});
+            const payload=canonical(action);
+            const outcome=db.transaction(()=>{
+                const live=sessionFromCookie(req);if(!live||live.userId!==auth.userId)return {authLost:true};
+                const old=db.prepare('SELECT payload,result FROM protected_past_receipts WHERE owner=? AND action_id=?').get(auth.userId,action.action_id) as any;
+                if(old)return old.payload===payload?{result:JSON.parse(old.result),replayed:true}:{mismatch:true};
+                const norm=(v:string)=>v.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim();
+                const rows=(db.prepare('SELECT id,date,description,cat,cents,type,rec_key,fitid FROM transactions WHERE owner=? AND deleted=0').all(auth.userId) as any[]).filter(t=>t.type===action.type&&norm(t.description)===action.key);
+                const matches=rows.map(t=>({id:t.id,version:currentVersion(auth.userId,'tx',t.id)})).sort((a,b)=>a.id.localeCompare(b.id));
+                let error='';
+                if(canonical(matches)!==canonical(action.matches))error='Os lançamentos correspondentes mudaram. Reabra a sugestão e confira o conjunto atual.';
+                if(action.ops.some((o:any)=>currentVersion(auth.userId,o.entity,o.id)!==o.base_version||db.prepare('SELECT 1 FROM protected_receipts WHERE owner=? AND op_id=?').get(auth.userId,o.op_id)))error='Um item da ação mudou. Reabra a sugestão e confira antes de tentar novamente.';
+                const txOps=action.ops.filter((o:any)=>o.entity==='tx'),ruleOps=action.ops.filter((o:any)=>o.entity==='catrule'),catOps=action.ops.filter((o:any)=>o.entity==='cat');
+                // This action may not edit existing category metadata.
+                const destination=db.prepare('SELECT id,deleted,type FROM categories WHERE owner=? AND id=?').get(auth.userId,action.cat) as any;
+                const allowedDefault=PAST_DEFAULT_CATS.find(c=>c.id===action.cat&&c.type===action.type);
+                if(destination){
+                    if(catOps.length)error=error||'Esta ação não pode editar os dados de uma categoria existente. Reabra e confira.';
+                }else if(!allowedDefault||catOps.length!==1||canonical(catOps[0].data)!==canonical(allowedDefault))error=error||'Esta ação só pode materializar a categoria padrão necessária, sem alterar seus dados.';
+                const affected=rows.filter(t=>t.cat!==action.cat);
+                const expectedTx=(t:any)=>({id:t.id,date:t.date,desc:t.description,cat:action.cat,cents:t.cents,type:t.type,...(t.rec_key?{recKey:t.rec_key}:{}),...(t.fitid?{fitid:t.fitid}:{})});
+                if(txOps.length!==affected.length||new Set(action.ops.map((o:any)=>o.entity+':'+o.id)).size!==action.ops.length||new Set(action.ops.map((o:any)=>o.op_id)).size!==action.ops.length||affected.some(t=>!txOps.some((o:any)=>o.id===t.id&&canonical(o.data)===canonical(expectedTx(t))))||ruleOps.length!==1||ruleOps[0]?.id!==action.key||ruleOps[0]?.data?.key!==action.key||ruleOps[0]?.data?.type!==action.type||ruleOps[0]?.data?.cat!==action.cat||catOps.length>1||catOps.some((o:any)=>o.id!==action.cat||o.data?.id!==action.cat))error=error||'Conteúdo da ação não confere. Reabra a sugestão.';
+                const existingRule=db.prepare('SELECT rule_key,description,type,at FROM catrules WHERE owner=? AND rule_key=? AND deleted=0').get(auth.userId,action.key) as any;
+                if(!existingRule||canonical(ruleOps[0]?.data)!==canonical({key:existingRule.rule_key,desc:existingRule.description,type:existingRule.type,at:existingRule.at,cat:action.cat}))error=error||'A sugestão mudou. Reabra e confira.';
+                let result:any;
+                if(!error){try{
+                    result=db.transaction(()=>{
+                        const results:any[]=[];
+                        for(const op of action.ops){const applied=applyOps(String(body.device||auth.device),auth.userId,[{...op,ts:Date.now()}]);if(applied.results[0]?.status!=='applied')throw Error('Uma operação não foi aceita.');results.push({...applied.results[0],version:currentVersion(auth.userId,op.entity,op.id)});}
+                        for(let i=0;i<action.ops.length;i++)db.prepare('INSERT INTO protected_receipts(owner,op_id,payload,result) VALUES(?,?,?,?)').run(auth.userId,action.ops[i].op_id,canonical(action.ops[i]),JSON.stringify(results[i]));
+                        return {status:'applied',results};
+                    })();
+                }catch{error='A ação não pôde ser aplicada inteira. Nada desta ação foi salvo. Reabra e confira.';}}
+                if(error)result={status:'conflict',results:action.ops.map(()=>({status:'conflict',error}))};
+                db.prepare('INSERT INTO protected_past_receipts(owner,action_id,payload,result) VALUES(?,?,?,?)').run(auth.userId,action.action_id,payload,JSON.stringify(result));
+                return {result,replayed:false};
+            }).immediate();
+            if(outcome.authLost)return send(res,401,{error:'Entre novamente.'});
+            if(outcome.mismatch)return send(res,409,{error:'Identificação já usada com outro conteúdo.'});
+            return send(res,200,{username:sess.username,receipt:true,action,...outcome});
+        }
+
+        if(req.method==='GET'&&p.startsWith('/api/attempts/')){
+            if(auth.kind!=='session'||!sess)return send(res,403,{error:'Use o app.'});
+            const row=db.prepare('SELECT payload,result FROM protected_receipts WHERE owner=? AND op_id=?').get(auth.userId,p.slice('/api/attempts/'.length)) as any;
+            return send(res,200,{username:sess.username,receipt:!!row,...(row?{attempt:JSON.parse(row.payload),result:JSON.parse(row.result)}:{})});
+        }
+        if(req.method==='POST'&&p==='/api/attempts'){
+            if(auth.kind!=='session'||!sess)return send(res,403,{error:'Use o app.'});
+            const body=await readBody(req);const live=sessionFromCookie(req);
+            if(!live||live.userId!==auth.userId)return send(res,401,{error:'Entre novamente.'});
+            if(req.headers['x-dindin-client']!=='protected-v1'||body.username!==live.username)return send(res,409,{error:'Atualize o app e confira a conta.'});
+            const op=body.attempt;
+            if(!op||op.owner!==live.username||typeof op.op_id!=='string'||op.op_id.length>128||op.op_id.length<8||!['tx','cat','rec','catrule'].includes(op.entity)||!Number.isInteger(op.base_version))return send(res,400,{error:'Tentativa inválida.'});
+            const payload=canonical(op);
+            const result=db.transaction(()=>{
+                const receipt=db.prepare('SELECT payload,result FROM protected_receipts WHERE owner=? AND op_id=?').get(auth.userId,op.op_id) as any;
+                if(receipt){if(receipt.payload!==payload)return {mismatch:true};return {result:JSON.parse(receipt.result),replayed:true};}
+                const version=currentVersion(auth.userId,op.entity,op.id);
+                let result:any;
+                if(version!==op.base_version)result={status:'conflict',error:'O item mudou no servidor. Confira antes de criar outra tentativa.',version};
+                else{
+                    const applied=applyOps(String(body.device||auth.device),auth.userId,[{...op,ts:Date.now()}]);
+                    result={...applied.results[0],version:currentVersion(auth.userId,op.entity,op.id)};
+                }
+                db.prepare('INSERT INTO protected_receipts(owner,op_id,payload,result) VALUES(?,?,?,?)').run(auth.userId,op.op_id,payload,JSON.stringify(result));return {result,replayed:false};
+            })();
+            if(result.mismatch)return send(res,409,{error:'Identificação já usada com outro conteúdo.'});
+            return send(res,200,{username:live.username,receipt:true,attempt:op,...result});
         }
 
         if (req.method === 'POST' && p === '/api/sync') {
             const body = await readBody(req);
+            if(auth.kind === 'session') {
+                const live=sessionFromCookie(req);
+                if(!live || live.userId!==auth.userId) return send(res,401,{error:'Entre novamente.'});
+                if(true) return send(res,409,{error:'Conta da fila não corresponde à sessão. Atualize o app.'});
+            }
             if (auth.kind === 'service') {
                 // escopos: tx:create (novo), tx:edit (alterar existente), tx:delete. Lote pequeno, tudo ou nada.
                 const can = (sc: string) => auth.scopes!.has(sc);
@@ -871,6 +1063,60 @@ const server = http.createServer(async (req, res) => {
             return send(res, n ? 200 : 404, { ok: !!n, error: n ? undefined : 'Acesso não encontrado.' });
         }
 
+        if (req.method === 'POST' && p === '/api/auth/password') {
+            if(auth.kind !== 'session' || !sess) return send(res,403,{error:'Use uma sessão do app.'});
+            const body = await readBody(req);
+            if(body.password !== body.confirm) return send(res,400,{error:'As duas senhas não conferem.'});
+            const issue = passwordIssues(body.password); if(issue) return send(res,400,{error:issue});
+            const key='password:'+auth.userId; const lock=lockInfo(key);
+            if(lock.locked) return send(res,429,{error:'Muitas tentativas. Aguarde antes de tentar novamente.'});
+            const changed=db.transaction(()=>{
+                const current=sessionFromCookie(req);
+                if(!current || current.userId!==auth.userId) return {status:401,error:'Entre novamente.'};
+                const user=db.prepare('SELECT pass_hash FROM users WHERE id=? AND active=1').get(auth.userId) as any;
+                if(!user || !verifyPassword(String(body.current||''),user.pass_hash)) return {status:400,error:'Senha atual incorreta.'};
+                const hash=hashPassword(body.password);
+                db.prepare('UPDATE users SET pass_hash=? WHERE id=?').run(hash,auth.userId);
+                db.prepare('DELETE FROM sessions WHERE user_id=?').run(auth.userId);
+                const replacement=createSession(sess.device,auth.userId,String(req.headers['user-agent']||''));
+                return {status:200,replacement};
+            })();
+            if(changed.status!==200){if(changed.status===400)noteFail(key);return send(res,changed.status,{error:changed.error});}
+            clearFails(key);
+            return send(res,200,{ok:true,aiAccessesKept:true},{'set-cookie':cookieHeader(changed.replacement!.token,SESSION_TTL_MS/1000)});
+        }
+
+        // ---------- Aparelhos conectados (sessoes do proprio usuario) ----------
+        // Regras: so sessao de login (token de IA nao lista nem encerra); cada
+        // usuario so ve e so encerra as PROPRIAS sessoes — pedido de sessao alheia
+        // responde "nao encontrada", sem vazar nem a existencia. A lista nunca
+        // devolve token nem hash: o id publico e aleatorio e so serve de referencia.
+        if (req.method === 'GET' && p === '/api/sessions') {
+            if (auth.kind !== 'session' || !sess) return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
+            const cur = sha256(sess.token);
+            const now = Date.now();
+            const rows = db.prepare('SELECT public_id, device, created_at, token_hash FROM sessions WHERE user_id = ? AND expires_at > ? ORDER BY created_at DESC').all(auth.userId, now) as any[];
+            return send(res, 200, {
+                sessions: rows.map(r => ({ id: r.public_id, device: r.device, created_at: r.created_at, current: r.token_hash === cur })),
+            });
+        }
+
+        if (req.method === 'POST' && p === '/api/sessions/close') {
+            if (auth.kind !== 'session') return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
+            const body = await readBody(req);
+            if (!sessionFromCookie(req)) return send(res,401,{error:'Entre novamente.'});
+            const id = String(body.id || '').slice(0, 64);
+            const n = db.prepare('DELETE FROM sessions WHERE user_id = ? AND public_id = ?').run(auth.userId, id).changes;
+            return send(res, n ? 200 : 404, { ok: !!n, error: n ? undefined : 'Sessão não encontrada.' });
+        }
+
+        if (req.method === 'POST' && p === '/api/sessions/close-others') {
+            if (auth.kind !== 'session' || !sess) return send(res, 403, { error: 'Este acesso não tem essa permissão.' });
+            if (!sessionFromCookie(req)) return send(res,401,{error:'Entre novamente.'});
+            const n = db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?').run(auth.userId, sha256(sess.token)).changes;
+            return send(res, 200, { ok: true, closed: n });
+        }
+
         if (req.method === 'GET' && p === '/api/history') {
             const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 50, 1), 200);
             const device = String(url.searchParams.get('device') || '').slice(0, 80);
@@ -878,7 +1124,7 @@ const server = http.createServer(async (req, res) => {
                 ? db.prepare('SELECT seq, ts, device, entity, rid, op, before, after FROM history WHERE owner = ? AND device = ? ORDER BY seq DESC LIMIT ?').all(auth.userId, device, limit)
                 : db.prepare('SELECT seq, ts, device, entity, rid, op, before, after FROM history WHERE owner = ? ORDER BY seq DESC LIMIT ?').all(auth.userId, limit)) as any[];
             return send(res, 200, {
-                entries: rows.map(r => ({ ...r, before: r.before ? JSON.parse(r.before) : null, after: r.after ? JSON.parse(r.after) : null })),
+                username:sess?.username,entries: rows.map(r => ({ ...r, before: r.before ? JSON.parse(r.before) : null, after: r.after ? JSON.parse(r.after) : null })),
             });
         }
 

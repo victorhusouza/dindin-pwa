@@ -1,3 +1,7 @@
+import {hydrate} from './sync';
+import {useProtectedCollection,setDefaults,beginEdit,endEdit,atomicSave,snapshot, type PastGuard} from './protectedStore';
+import {PendingPanel} from './PendingPanel';
+import {SecuritySheet} from './SecuritySheet';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocalState } from './localState';
 import { decryptBackupJson, encryptBackupJson, isEncryptedBackup } from './crypto';
@@ -175,67 +179,7 @@ function salvageRows(joined: string): Tx[] {
 }
 
 // Fatias fixas de texto no localStorage (cada uma bem abaixo do limite do navegador).
-function useChunkedTxs(): [Tx[], (v: Tx[]) => boolean, { ready: boolean; message: string; failed: boolean; salvage: boolean }] {
-    const h0 = useLocalState('mf.txs.0', '');
-    const h1 = useLocalState('mf.txs.1', '');
-    const h2 = useLocalState('mf.txs.2', '');
-    const h3 = useLocalState('mf.txs.3', '');
-    const h4 = useLocalState('mf.txs.4', '');
-    const h5 = useLocalState('mf.txs.5', '');
-    const h6 = useLocalState('mf.txs.6', '');
-    const h7 = useLocalState('mf.txs.7', '');
-    const h8 = useLocalState('mf.txs.8', '');
-    const h9 = useLocalState('mf.txs.9', '');
-    const h10 = useLocalState('mf.txs.10', '');
-    const h11 = useLocalState('mf.txs.11', '');
-    const h12 = useLocalState('mf.txs.12', '');
-    const h13 = useLocalState('mf.txs.13', '');
-    const h14 = useLocalState('mf.txs.14', '');
-    const h15 = useLocalState('mf.txs.15', '');
-    const h16 = useLocalState('mf.txs.16', '');
-    const h17 = useLocalState('mf.txs.17', '');
-    const h18 = useLocalState('mf.txs.18', '');
-    const h19 = useLocalState('mf.txs.19', '');
-    const h20 = useLocalState('mf.txs.20', '');
-    const h21 = useLocalState('mf.txs.21', '');
-    const h22 = useLocalState('mf.txs.22', '');
-    const h23 = useLocalState('mf.txs.23', '');
-    const h24 = useLocalState('mf.txs.24', '');
-    const h25 = useLocalState('mf.txs.25', '');
-    const h26 = useLocalState('mf.txs.26', '');
-    const h27 = useLocalState('mf.txs.27', '');
-    const h28 = useLocalState('mf.txs.28', '');
-    const h29 = useLocalState('mf.txs.29', '');
-    const h30 = useLocalState('mf.txs.30', '');
-    const h31 = useLocalState('mf.txs.31', '');
-    const hooks = [h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18, h19, h20, h21, h22, h23, h24, h25, h26, h27, h28, h29, h30, h31];
-    const ready = hooks.every(h => h[2] && h[2].ready);
-    const message = Array.from(new Set(hooks.map(h => (h[2] && h[2].message) || '').filter(Boolean))).join(' ');
-    const failed = hooks.some(h => { const st = (h[2] as unknown as { status?: string }).status; return st === 'quota' || st === 'invalid'; });
-    const joined = hooks.map(h => h[0] || '').join('');
-    let salvage = false;
-    let txs: Tx[] = [];
-    if (joined) {
-        try {
-            const raw: unknown = JSON.parse(joined);
-            if (Array.isArray(raw)) txs = raw.map((p, i) => unpackTx(p, i)).filter((t): t is Tx => t !== null);
-        } catch (e) {
-            // Estado misto de gravacoes parciais: resgata as linhas completas.
-            txs = salvageRows(joined);
-            salvage = txs.length > 0;
-        }
-    }
-    const set = (v: Tx[]): boolean => {
-        const s = JSON.stringify(v.map(packTx));
-        if (s.length > CHUNKS * CHUNK_CAP) return false;
-        const parts = packChunks(s);
-        let ok = true;
-        // Grava do fim para o começo: libera as fatias antigas grandes antes de escrever as novas, sem estourar a cota total no meio do caminho.
-        for (let i = CHUNKS - 1; i >= 0; i--) { if (!hooks[i][1](parts[i])) ok = false; }
-        return ok;
-    };
-    return [txs, set, { ready, message, failed, salvage }];
-}
+function useChunkedTxs(){return useProtectedCollection<Tx>('tx')}
 
 // ---------- leitura de XLSX (sem dependências) ----------
 
@@ -426,7 +370,7 @@ function parseOfx(text: string): Omit<Tx, 'id'>[] {
         const tx: Omit<Tx, 'id'> = {
             type: amt < 0 ? 'despesa' : 'receita',
             desc,
-            cat: 'outros',
+            cat: amt < 0 ? 'outros-d' : 'outros-r',
             cents: Math.round(Math.abs(amt) * 100),
             date,
         };
@@ -762,6 +706,7 @@ function StorageMeter({ txs, cats, recs }: { txs: Tx[]; cats: Category[]; recs: 
         Seus dados completos ficam na sua VM.
     </div>;
 }
+setDefaults(DEFAULT_CATS);
 export function App() {
     const [txs, setTxs, txsSaved] = useChunkedTxs();
     // Chaves legadas de versoes antigas do app: o viewer nunca apaga chaves, entao
@@ -773,9 +718,9 @@ export function App() {
     const legE = useLocalState('mf.state', null as unknown);
     const txsRef = useRef<Tx[]>([]);
     txsRef.current = txs;
-    const [cats, setCats, catsSaved] = useLocalState('mf.cats.v1', [] as Category[]);
-    const [recs, setRecs, recsSaved] = useLocalState('mf.recs.v1', SEED_RECS);
-    const [catRules, setCatRules, rulesSaved] = useLocalState('mf.catrules.v1', [] as CatRule[]);
+    const [cats, setCats, catsSaved] = useProtectedCollection<Category>('cat');
+    const [recs, setRecs, recsSaved] = useProtectedCollection<Rec>('rec');
+    const [catRules, setCatRules, rulesSaved] = useProtectedCollection<CatRule>('catrule');
     const [rulesSeeded, setRulesSeeded] = useLocalState('mf.catrules.seeded.v1', '');
     const catRulesRef = useRef<CatRule[]>([]);
     catRulesRef.current = catRules;
@@ -790,6 +735,7 @@ export function App() {
     const [showForm, setShowForm] = useState(false);
     const [editing, setEditing] = useState<Tx | null>(null);
     const [menuOpen, setMenuOpen] = useState(false);
+    const [showSecurity,setShowSecurity]=useState(false);
     const [showAIAccess, setShowAIAccess] = useState(false);
     const [isAdmin, setIsAdmin] = useState(false);
     const [showAdmin, setShowAdmin] = useState(false);
@@ -815,6 +761,7 @@ export function App() {
     const [decErr, setDecErr] = useState('');
     const exportTaRef = useRef<HTMLTextAreaElement | null>(null);
     const [notice, setNotice] = useState('');
+    useEffect(()=>{const f=(e:Event)=>setNotice((e as CustomEvent).detail);window.addEventListener('dindin-error',f);return()=>window.removeEventListener('dindin-error',f)},[]);
     const importInput = useRef<HTMLInputElement>(null);
     const restoreInput = useRef<HTMLInputElement>(null);
 
@@ -935,35 +882,18 @@ export function App() {
         persistTxsRef.current(txsRef.current);
     }, [txsSaved.ready, txsSaved.salvage]);
 
-    // Remove duplicatas exatas acumuladas (mantém a mais recente), uma vez por abertura.
-    const dedupedRef = useRef(false);
-    useEffect(() => {
-        if (!txsSaved.ready || dedupedRef.current || txsRef.current.length === 0) return;
-        dedupedRef.current = true;
-        const seen = new Set<string>();
-        let changed = false;
-        const out = txsRef.current.filter(t => {
-            const k = [t.date, t.desc, t.cat, t.cents, t.type, t.recKey ?? ''].join('|');
-            if (seen.has(k)) { changed = true; return false; }
-            seen.add(k);
-            return true;
-        });
-        if (changed) persistTxsRef.current(out);
-    }, [txsSaved.ready]);
-
     const saveTx = (tx: Tx) => {
         const exists = txs.some(t => t.id === tx.id);
-        if (!persistTxs(exists ? txs.map(t => (t.id === tx.id ? tx : t)) : [tx, ...txs])) return;
-        learnFromTxs([tx]);
-        setShowForm(false);
+        if(!atomicSave(()=>persistTxs(exists ? txs.map(t => (t.id === tx.id ? tx : t)) : [tx, ...txs])&&learnFromTxs([tx])))return;
+        endEdit();setShowForm(false);
         setEditing(null);
     };
 
     const deleteTx = (id: string) => {
-        persistTxs(txs.filter(t => t.id !== id));
-        setShowForm(false);
+        if(!persistTxs(txs.filter(t => t.id !== id)))return;
+        endEdit();setShowForm(false);
         setEditing(null);
-        setNotice('Lançamento excluído.');
+        setNotice('Pedido de exclusão guardado no aparelho. Confira a confirmação em Pendências.');
     };
 
     const monthKey = month.y + '-' + String(month.m + 1).padStart(2, '0');
@@ -975,31 +905,30 @@ export function App() {
         const day = Math.min(r.dueDay, daysInMonth);
         const date = monthKey + '-' + String(day).padStart(2, '0');
         const paidTx: Tx = { id: uid(), type: 'despesa', desc: r.desc, cat: r.cat, cents: r.cents, date, recKey: key };
-        if (!persistTxs([paidTx, ...txs])) return;
-        learnFromTxs([paidTx]);
-        setNotice(r.desc + ' marcada como paga.');
+        if(!atomicSave(()=>persistTxs([paidTx,...txs])&&learnFromTxs([paidTx])))return;
+        setNotice('Tentativa de pagamento guardada no aparelho. Confira Pendências.');
     };
 
     const unpayRec = (r: Rec) => {
         const key = r.id + ':' + monthKey;
         if (recUndoKey !== key) { setRecUndoKey(key); return; }
+        if(!persistTxs(txs.filter(t => t.recKey !== key)))return;
         setRecUndoKey('');
-        persistTxs(txs.filter(t => t.recKey !== key));
-        setNotice('Pagamento desfeito.');
+        setNotice('Pedido de desfazer guardado no aparelho. Confira a confirmação em Pendências.');
     };
 
     const saveRec = (r: Rec) => {
         const exists = recs.some(x => x.id === r.id);
-        setRecs(exists ? recs.map(x => (x.id === r.id ? r : x)) : [...recs, r]);
-        setShowRecForm(false);
+        if(!setRecs(exists ? recs.map(x => (x.id === r.id ? r : x)) : [...recs, r]))return;
+        endEdit();setShowRecForm(false);
         setRecEditing(null);
     };
 
     const deleteRec = (id: string) => {
-        setRecs(recs.filter(x => x.id !== id));
-        setShowRecForm(false);
+        if(!setRecs(recs.filter(x => x.id !== id)))return;
+        endEdit();setShowRecForm(false);
         setRecEditing(null);
-        setNotice('Conta fixa removida. Os lançamentos já feitos continuam no histórico.');
+        setNotice('Pedido de remover conta fixa guardado localmente. Confira Pendências. Os lançamentos anteriores não serão apagados.');
     };
 
     // Nome repetido (mesmo nome ignorando acento/maiuscula, tipo compativel): avisa e
@@ -1011,7 +940,7 @@ export function App() {
         if (clash) { setNotice('Você já tem a categoria "' + clash.label + '" — usei ela.'); return clash.id; }
         const id = 'c:' + slug(label);
         if (!allCats.some(c => c.id === id)) {
-            setCats([...cats, { id, label, icon: '🏷️', color: PALETTE[cats.length % PALETTE.length], type }]);
+            if(!setCats([...cats, { id, label, icon: '🏷️', color: PALETTE[cats.length % PALETTE.length], type }]))return '';
         }
         return id;
     };
@@ -1026,10 +955,10 @@ export function App() {
             if (key.length < 3) continue;
             add.set(t.type + '|' + key, { key, desc: t.desc.trim(), cat: t.cat, type: t.type, at: t.date });
         }
-        if (!add.size) return;
+        if (!add.size) return true;
         const merged = catRulesRef.current.filter(r => !add.has(r.type + '|' + r.key));
         const next = [...add.values(), ...merged].sort((a, b) => b.at.localeCompare(a.at));
-        setCatRules(next.slice(0, 400));
+        return setCatRules(next.slice(0, 400));
     };
 
     // Semeia as associacoes a partir do historico existente (uma vez por aparelho).
@@ -1049,16 +978,17 @@ export function App() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [storeReady, rulesSeeded]);
 
-    const saveRule = (rule: CatRule, applyPast: boolean) => {
+    const saveRule = (rule: CatRule, applyPast: boolean,guard?:PastGuard) => {
         const affected = applyPast ? txs.filter(t => t.type === rule.type && normTxt(t.desc) === rule.key && t.cat !== rule.cat) : [];
-        if (affected.length && !persistTxs(txs.map(t => affected.some(a => a.id === t.id) ? { ...t, cat: rule.cat } : t))) return;
-        setCatRules(catRulesRef.current.map(r => (r.key === rule.key && r.type === rule.type) ? rule : r));
-        setNotice(affected.length ? 'Sugestão e ' + affected.length + ' ' + (affected.length === 1 ? 'lançamento anterior atualizado.' : 'lançamentos anteriores atualizados.') : 'Sugestão atualizada.');
+        if(!atomicSave(()=>(!affected.length||persistTxs(txs.map(t=>affected.some(a=>a.id===t.id)?{...t,cat:rule.cat}:t)))&&setCatRules(catRulesRef.current.map(r=>(r.key===rule.key&&r.type===rule.type)?rule:r)),guard))return;
+        setNotice('Ação de sugestão guardada no aparelho. Confira o resultado em Pendências.');
+        endEdit();return true;
     };
 
     const forgetRule = (rule: CatRule) => {
-        setCatRules(catRulesRef.current.filter(r => !(r.key === rule.key && r.type === rule.type)));
-        setNotice('Sugestão esquecida. As palavras-chave do app ainda podem sugerir uma categoria.');
+        if(!setCatRules(catRulesRef.current.filter(r => !(r.key === rule.key && r.type === rule.type))))return;
+        setNotice('Pedido de esquecer sugestão guardado localmente. Confira Pendências.');
+        endEdit();return true;
     };
 
     // O app roda num iframe sem permissao de download, entao o clique num link
@@ -1178,6 +1108,7 @@ export function App() {
                 fresh.push({ ...p, id: uid() });
             }
             if (!fresh.length) throw new Error('Todos os lançamentos do arquivo já foram importados antes.');
+            endEdit();beginEdit('pref','file-preview');
             setPreview({ source: file.name, txs: fresh, catLabels, skipped });
         } catch (e: any) {
             setNotice(e && e.message ? e.message : 'Não consegui ler esse arquivo.');
@@ -1201,11 +1132,10 @@ export function App() {
                 newCats.push({ id, label, icon: '🏷️', color: PALETTE[(cats.length + newCats.length) % PALETTE.length], type: 'ambos' });
             }
         }
-        if (!persistTxs([...txs, ...mappedTxs])) return;
-        learnFromTxs(mappedTxs);
-        if (newCats.length) setCats([...cats, ...newCats]);
+        if(!atomicSave(()=>(!newCats.length||setCats([...cats,...newCats]))&&persistTxs([...txs,...mappedTxs])&&learnFromTxs(mappedTxs)))return;
+        endEdit();
         setMonth({ y: new Date(mappedTxs[0].date + 'T12:00:00').getFullYear(), m: new Date(mappedTxs[0].date + 'T12:00:00').getMonth() });
-        setNotice(preview.txs.length + ' lançamentos importados' + (preview.skipped ? ' (' + preview.skipped + ' duplicados ignorados)' : '') + '.');
+        setNotice(preview.txs.length + ' tentativas de importação guardadas no aparelho' + (preview.skipped ? ' (' + preview.skipped + ' duplicados ignorados)' : '') + '. Confira os resultados em Pendências.');
         setPreview(null);
     };
 
@@ -1220,7 +1150,7 @@ export function App() {
                 setEncRestore({ text });
             } else {
                 if (!parsed || parsed.app !== 'minhas-financas' || !Array.isArray(parsed.txs)) throw new Error('Esse arquivo não é um backup do Minhas Finanças.');
-                setRestore({ txs: parsed.txs, cats: Array.isArray(parsed.cats) ? parsed.cats : [], rules: Array.isArray(parsed.rules) ? parsed.rules : undefined });
+                endEdit();beginEdit('pref','file-preview');setRestore({ txs: parsed.txs, cats: Array.isArray(parsed.cats) ? parsed.cats : [], rules: Array.isArray(parsed.rules) ? parsed.rules : undefined });
             }
         } catch (e: any) {
             setNotice(e && e.message ? e.message : 'Não consegui ler o backup.');
@@ -1237,7 +1167,7 @@ export function App() {
             const parsed = JSON.parse(plainJson);
             if (!parsed || parsed.app !== 'minhas-financas' || !Array.isArray(parsed.txs)) throw new Error('formato');
             setEncRestore(null);
-            setRestore({ txs: parsed.txs, cats: Array.isArray(parsed.cats) ? parsed.cats : [], rules: Array.isArray(parsed.rules) ? parsed.rules : undefined });
+            endEdit();beginEdit('pref','file-preview');setRestore({ txs: parsed.txs, cats: Array.isArray(parsed.cats) ? parsed.cats : [], rules: Array.isArray(parsed.rules) ? parsed.rules : undefined });
         } catch (e: any) {
             if (e && e.message === 'senha') setDecErr('Senha incorreta ou arquivo adulterado. Confira a senha e tente de novo.');
             else setDecErr('Não consegui abrir este backup. O arquivo pode estar corrompido.');
@@ -1247,11 +1177,10 @@ export function App() {
 
     const confirmRestore = () => {
         if (!restore) return;
-        if (!persistTxs(restore.txs)) return;
-        setCats(restore.cats);
-        if (restore.rules) setCatRules(restore.rules);
+        if(!atomicSave(()=>setCats(restore.cats)&&persistTxs(restore.txs)&&(!restore.rules||setCatRules(restore.rules))))return;
+        endEdit();
         setRestore(null);
-        setNotice('Backup restaurado.');
+        setNotice('Tentativas de restauração guardadas no aparelho. Confira os resultados em Pendências.');
     };
 
     return <>
@@ -1262,7 +1191,7 @@ export function App() {
                     <button className="iconbtn" aria-label={theme === 'dark' ? 'Tema claro' : 'Tema escuro'} onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>
                         {theme === 'dark' ? '☀️' : '🌙'}
                     </button>
-                    <button className="iconbtn topbar-add" aria-label="Adicionar lançamento" onClick={() => { setEditing(null); setShowForm(true); }}>＋</button>
+                    <button className="iconbtn topbar-add" aria-label="Adicionar lançamento" onClick={() => { endEdit();setEditing(null); setShowForm(true); }}>＋</button>
                     <button className="iconbtn" aria-label="Menu" onClick={() => setMenuOpen(true)}>⋯</button>
                 </div>
             </header>
@@ -1369,7 +1298,7 @@ export function App() {
                     const paid = txs.some(t => t.recKey === key);
                     const undoing = recUndoKey === key;
                     return <div className="recrow" key={r.id}>
-                        <button className="rec-main" onClick={() => { setRecEditing(r); setShowRecForm(true); }}>
+                        <button className="rec-main" onClick={() => { endEdit();beginEdit('rec',r.id);setRecEditing(r); setShowRecForm(true); }}>
                             <span className="tx-icon" style={{ background: c.color + '22' }}>{c.icon}</span>
                             <span className="tx-main">
                                 <span className="tx-desc">{r.desc}</span>
@@ -1382,7 +1311,7 @@ export function App() {
                             : <button className="paybtn" onClick={() => payRec(r)}>Pagar</button>}
                     </div>;
                 })}
-                <button className="chip addrec" onClick={() => { setRecEditing(null); setShowRecForm(true); }}>＋ Nova conta fixa</button>
+                <button className="chip addrec" onClick={() => { endEdit();setRecEditing(null); setShowRecForm(true); }}>＋ Nova conta fixa</button>
             </section>}
 
             <section className="txlist">
@@ -1397,7 +1326,7 @@ export function App() {
                         <h3 className="dayhead">{label}</h3>
                         {txs.map(t => {
                             const c = catById(t.cat);
-                            return <button className="tx" key={t.id} onClick={() => { setEditing(t); setShowForm(true); }}>
+                            return <button className="tx" key={t.id} onClick={() => { endEdit();beginEdit('tx',t.id);setEditing(t); setShowForm(true); }}>
                                 <span className="tx-icon" style={{ background: c.color + '22' }}>{c.icon}</span>
                                 <span className="tx-main">
                                     <span className="tx-desc">{t.desc}</span>
@@ -1410,7 +1339,7 @@ export function App() {
                 })}
             </section>
 
-            <button className="fab" aria-label="Adicionar lançamento" onClick={() => { setEditing(null); setShowForm(true); }}>+</button>
+            <button className="fab" aria-label="Adicionar lançamento" onClick={() => { endEdit();setEditing(null); setShowForm(true); }}>+</button>
 
             {notice !== '' && <div className="toast" role="status">{notice}</div>}
 
@@ -1422,6 +1351,7 @@ export function App() {
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowExportChoice(true); }}>☁️ Exportar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); restoreInput.current && restoreInput.current.click(); }}>↩️ Restaurar backup</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowInstall(true); }}>📲 Instalar na tela de início</button>
+                    <button className="sheetbtn" onClick={()=>{setMenuOpen(false);setShowSecurity(true)}}>🔐 Senha e aparelhos</button>
                     <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowAIAccess(true); }}>🤖 Acessos de IA</button>
                     {isAdmin && <button className="sheetbtn" onClick={() => { setMenuOpen(false); setShowAdmin(true); }}>🛡️ Administração</button>}
                     <StorageMeter txs={txs} cats={cats} recs={recs} />
@@ -1429,6 +1359,8 @@ export function App() {
                 </div>
             </Overlay>}
 
+            <PendingPanel/>
+            {showSecurity && <SecuritySheet onClose={()=>setShowSecurity(false)}/>}
             {showAIAccess && <Overlay onClose={() => setShowAIAccess(false)}>
                 <div className="sheet" onClick={e => e.stopPropagation()}>
                     <AIAccessSheet onClose={() => setShowAIAccess(false)} />
@@ -1488,7 +1420,7 @@ export function App() {
 
             {preview && <Overlay>
                 <div className="sheet">
-                    <div className="sheethead"><h2>Importar de {preview.source}</h2><button className="sheetx" aria-label="Fechar" onClick={() => setPreview(null)}>✕</button></div>
+                    <div className="sheethead"><h2>Importar de {preview.source}</h2><button className="sheetx" aria-label="Fechar" onClick={()=>{endEdit();setPreview(null)}}>✕</button></div>
                     <p>{preview.txs.length} lançamentos encontrados
                         {preview.skipped > 0 ? ' · ' + preview.skipped + ' duplicados serão ignorados' : ''}.</p>
                     <div className="preview-list">
@@ -1500,16 +1432,16 @@ export function App() {
                         {preview.txs.length > 5 && <p className="hint">… e mais {preview.txs.length - 5}.</p>}
                     </div>
                     <button className="sheetbtn primary" onClick={confirmImport}>Importar {preview.txs.length} lançamentos</button>
-                    <button className="sheetbtn ghost" onClick={() => setPreview(null)}>Cancelar</button>
+                    <button className="sheetbtn ghost" onClick={()=>{endEdit();setPreview(null)}}>Cancelar</button>
                 </div>
             </Overlay>}
 
             {restore && <Overlay>
                 <div className="sheet">
-                    <div className="sheethead"><h2>Restaurar backup</h2><button className="sheetx" aria-label="Fechar" onClick={() => setRestore(null)}>✕</button></div>
+                    <div className="sheethead"><h2>Restaurar backup</h2><button className="sheetx" aria-label="Fechar" onClick={()=>{endEdit();setRestore(null)}}>✕</button></div>
                     <p>O backup tem {restore.txs.length} lançamentos. Restaurar <strong>substitui</strong> todos os dados atuais deste aparelho.</p>
                     <button className="sheetbtn primary" onClick={confirmRestore}>Substituir e restaurar</button>
-                    <button className="sheetbtn ghost" onClick={() => setRestore(null)}>Cancelar</button>
+                    <button className="sheetbtn ghost" onClick={()=>{endEdit();setRestore(null)}}>Cancelar</button>
                 </div>
             </Overlay>}
 
@@ -1519,7 +1451,7 @@ export function App() {
                 cats={allCats}
                 onSaveRule={saveRule}
                 onForget={forgetRule}
-                onClose={() => setShowCatRules(false)}
+                onClose={() => {endEdit();setShowCatRules(false)}}
             />}
 
             {showRecForm && <RecForm
@@ -1529,7 +1461,7 @@ export function App() {
                 onSave={saveRec}
                 onDelete={recEditing ? () => deleteRec(recEditing.id) : null}
                 onAddCategory={addCategory}
-                onClose={() => { setShowRecForm(false); setRecEditing(null); }}
+                onClose={() => { endEdit();setShowRecForm(false); setRecEditing(null); }}
             />}
 
             {showForm && <TxForm
@@ -1540,7 +1472,7 @@ export function App() {
                 onSave={saveTx}
                 onDelete={editing ? () => deleteTx(editing.id) : null}
                 onAddCategory={addCategory}
-                onClose={() => { setShowForm(false); setEditing(null); }}
+                onClose={() => { endEdit();setShowForm(false); setEditing(null); }}
             />}
 
             </>}
@@ -1827,8 +1759,8 @@ function CatRulesSheet(props: {
     rules: CatRule[];
     txs: Tx[];
     cats: Category[];
-    onSaveRule: (rule: CatRule, applyPast: boolean) => void;
-    onForget: (rule: CatRule) => void;
+    onSaveRule: (rule: CatRule, applyPast: boolean,guard?:PastGuard) => boolean | undefined;
+    onForget: (rule: CatRule) => boolean | undefined;
     onClose: () => void;
 }) {
     const [query, setQuery] = useState('');
@@ -1836,6 +1768,15 @@ function CatRulesSheet(props: {
     const [cat, setCat] = useState('');
     const [applyPast, setApplyPast] = useState(false);
     const [confirmForget, setConfirmForget] = useState(false);
+    const [reviewError,setReviewError]=useState('');
+    const [checking,setChecking]=useState(false);
+    const reviewGeneration=useRef(0);
+    const openedMatches=useRef('');
+    const openedGuard=useRef<PastGuard|null>(null);
+    useEffect(()=>()=>{reviewGeneration.current++},[]);
+    const matchingSignature=(r:CatRule,rows:Tx[],versions:Record<string,number>)=>JSON.stringify(rows.filter(t=>t.type===r.type&&normTxt(t.desc)===r.key).map(t=>({tx:Object.fromEntries(Object.entries(t).sort(([a],[b])=>a.localeCompare(b))),v:versions['tx:'+t.id]||0})).sort((a,b)=>String(a.tx.id).localeCompare(String(b.tx.id))));
+    const back=()=>{reviewGeneration.current++;endEdit();setSel(null);setReviewError('');setChecking(false)};
+
 
     const catOf = (id: string): Category => props.cats.find(c => c.id === id)
         || { id, label: id.replace(/^m:/, '').replace(/-/g, ' '), icon: '🏷️', color: '#8a8a8a', type: 'ambos' };
@@ -1849,7 +1790,7 @@ function CatRulesSheet(props: {
         return m;
     }, [props.txs]);
 
-    const open = (r: CatRule) => { setSel(r); setCat(r.cat); setApplyPast(false); setConfirmForget(false); };
+    const open = (r: CatRule) => { reviewGeneration.current++;openedGuard.current={key:r.key,type:r.type,cat:r.cat,matches:props.txs.filter(t=>t.type===r.type&&normTxt(t.desc)===r.key).map(t=>({id:t.id,version:snapshot().versions['tx:'+t.id]||0})).sort((a,b)=>a.id.localeCompare(b.id))};openedMatches.current=matchingSignature(r,props.txs,snapshot().versions);setReviewError('');setChecking(false);endEdit();beginEdit('catrule',r.key);for(const t of props.txs.filter(t=>t.type===r.type&&normTxt(t.desc)===r.key))beginEdit('tx',t.id);setSel(r); setCat(r.cat); setApplyPast(false); setConfirmForget(false); };
 
     if (sel) {
         const matches = props.txs
@@ -1858,17 +1799,29 @@ function CatRulesSheet(props: {
         const changed = cat !== '' && cat !== sel.cat;
         const affected = changed ? matches.filter(t => t.cat !== cat) : [];
         const catsForType = props.cats.filter(c => c.type === sel.type || c.type === 'ambos');
-        const save = () => {
-            if (!changed) return;
-            props.onSaveRule({ ...sel, cat }, applyPast);
-            setSel(null);
+        const save = async () => {
+            if (!changed||checking||reviewError) return;
+            if(applyPast){
+                const generation=reviewGeneration.current;setChecking(true);
+                try{
+                    await hydrate();
+                    if(generation!==reviewGeneration.current)return;
+                    const current=snapshot();
+                    if(openedMatches.current!==matchingSignature(sel,current.records.tx||[],current.versions)){
+                        setReviewError('Os lançamentos correspondentes mudaram. Nenhuma ação foi guardada. Volte e reabra esta sugestão para conferir o conjunto atual.');return;
+                    }
+                }catch{
+                    if(generation===reviewGeneration.current)setReviewError('Não foi possível conferir os lançamentos atuais. Nenhuma ação foi guardada. Volte e reabra esta sugestão para conferir antes de aplicar aos antigos.');return;
+                }finally{if(generation===reviewGeneration.current)setChecking(false)}
+            }
+            if(props.onSaveRule({ ...sel, cat }, applyPast,applyPast&&openedGuard.current?{...openedGuard.current,cat}:undefined))back();
         };
         return <Overlay onClose={props.onClose}>
             <div className="sheet" onClick={e => e.stopPropagation()}>
-                <div className="sheethead"><h2>{sel.desc}</h2><button className="sheetx" aria-label="Voltar" onClick={() => setSel(null)}>✕</button></div>
+                <div className="sheethead"><h2>{sel.desc}</h2><button className="sheetx" aria-label="Voltar" onClick={back}>✕</button></div>
                 <p className="hint">{sel.type === 'receita' ? 'Receita' : 'Despesa'} · o app sugere esta descrição como:</p>
                 <div className="catchips">
-                    {catsForType.map(c => <button key={c.id} className={'chip' + (cat === c.id ? ' sel' : '')} onClick={() => setCat(c.id)}>
+                    {catsForType.map(c => <button key={c.id} disabled={checking||!!reviewError} className={'chip' + (cat === c.id ? ' sel' : '')} onClick={() => setCat(c.id)}>
                         {c.icon} {c.label}
                     </button>)}
                 </div>
@@ -1884,15 +1837,16 @@ function CatRulesSheet(props: {
                     </div>
                 </>}
                 {changed && affected.length > 0 && <label className="checkrow">
-                    <input type="checkbox" checked={applyPast} onChange={e => setApplyPast(e.target.checked)} />
+                    <input type="checkbox" disabled={checking||!!reviewError} checked={applyPast} onChange={e => setApplyPast(e.target.checked)} />
                     <span>Atualizar também {affected.length === 1 ? 'o 1 lançamento anterior' : 'os ' + affected.length + ' lançamentos anteriores'}</span>
                 </label>}
                 <p className="hint">Mudar aqui vale para os próximos lançamentos{changed && affected.length > 0 ? ', a menos que você marque a opção acima' : ''}.</p>
-                <button className="sheetbtn primary" disabled={!changed} onClick={save}>Salvar</button>
-                <button className="sheetbtn danger" onClick={() => { if (confirmForget) { props.onForget(sel); setSel(null); } else setConfirmForget(true); }}>
+                {reviewError&&<p role="alert" className="hint">{reviewError}</p>}
+                <button className="sheetbtn primary" disabled={!changed||checking||!!reviewError} onClick={()=>void save()}>{checking?'Conferindo lançamentos…':'Salvar'}</button>
+                <button className="sheetbtn danger" disabled={checking} onClick={() => { if (confirmForget) { if(props.onForget(sel))back(); } else setConfirmForget(true); }}>
                     {confirmForget ? 'Toque de novo para confirmar' : 'Esquecer esta sugestão'}
                 </button>
-                <button className="sheetbtn ghost" onClick={() => setSel(null)}>Voltar</button>
+                <button className="sheetbtn ghost" onClick={back}>Voltar</button>
             </div>
         </Overlay>;
     }

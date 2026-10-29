@@ -233,3 +233,12 @@ html, body, #root { margin: 0; min-height: 100%; }
 }
 
 .admsection { margin: 18px 0 4px; font-size: 15px; }
+
+.securitysheet{max-height:90dvh;overflow:auto}.securitybody{padding:16px}.securitybody label{display:block;margin:12px 0}.securitybody input{display:block;width:100%;box-sizing:border-box;padding:10px}.securitybody p{line-height:1.5}.securitysession{padding:12px 0;border-top:1px solid #aaa}.securitysession button{display:block;margin-top:8px}
+.pendingpanel{margin:16px;padding:12px;border:1px solid var(--ink2);border-radius:12px;overflow-wrap:anywhere}.pendingpanel article{border-top:1px solid var(--ink2);margin-top:12px;padding:12px 0}.pendingpanel pre{white-space:pre-wrap;font-size:11px}
+.securityoverlay{z-index:2000!important}.pending-open button.fab{position:static}.pending-open .pendingpanel{padding-bottom:100px}.securitybody button,.pendingpanel button{font:inherit;border:1px solid var(--ink2);border-radius:8px;padding:10px;background:var(--paper);color:var(--ink)}.securitybody input{font:inherit;border:1px solid var(--ink2);border-radius:8px}.securitybody [role=alert]{color:#b42318}.pendingpanel pre{max-height:160px;overflow:auto}.pendingpanel article small{display:block}.pendingpanel{position:relative;z-index:1001;background:var(--paper,#fff)}
+.pendingpanel{z-index:2}.overlay{z-index:1500}.pending-open .fab{z-index:1!important}.pending-open .pendingpanel{isolation:isolate}.securitybody{font-family:var(--font,system-ui,sans-serif)}
+
+.gatecontrols{position:static!important;padding:16px;z-index:auto!important}.securityoverlay .sheet{max-height:90dvh}.pendingpanel article small{overflow-wrap:anywhere}
+.securitysheet>.sheethead{position:sticky;top:-20px;background:var(--bg);z-index:3;padding:8px 0}.securitysheet>.sheethead h2{font-size:18px}
+.pendingitem{border-top:1px solid var(--hairline);padding:12px 0}.pendingitem p{margin:6px 0}.pendingpanel h3{font-size:16px}.pendingitem [role=status]{color:var(--desp);font-weight:600}

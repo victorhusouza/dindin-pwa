@@ -1,3 +1,5 @@
+import {endEdit} from './protectedStore';
+import {setOwner} from './accountStorage';
 // Porta de entrada do app: setup da senha (primeiro uso), login, hidratacao
 // do estado vindo da VM e, logado, o app + botoes de Historico e Sair.
 import React, { useCallback, useEffect, useState } from 'react';
@@ -59,8 +61,8 @@ export function Gate({ children }: { children: React.ReactNode }) {
 
     const afterAuth = useCallback(async () => {
         setStage('hydrating');
-        try { await hydrate(); startSyncLoop(); setStage('ready'); }
-        catch { setErr('Sem conexão com o servidor. Tente de novo.'); setStage('login'); }
+        try { const r=await fetch('/api/auth/status',{credentials:'same-origin'});const b=await r.json();if(!b.authed)throw Error('Entre novamente.');endEdit();setOwner(b.username);await hydrate(); startSyncLoop(); setStage('ready'); }
+        catch(e) { setErr(e instanceof Error?e.message:'Não foi possível entrar.'); setStage('login'); }
     }, []);
 
     useEffect(() => {
@@ -86,14 +88,14 @@ export function Gate({ children }: { children: React.ReactNode }) {
         finally { setBusy(false); }
     };
 
-    const logout = async () => {
+    const logout = async () => {endEdit();
         try { await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' }); } catch { /* offline */ }
         window.location.reload();
     };
 
     if (stage === 'ready') return <>
         {children}
-        <div style={{ position: 'fixed', left: 10, bottom: 10, zIndex: 900, display: 'flex', gap: 8 }}>
+        <div className="gatecontrols" style={{ position: 'fixed', left: 10, bottom: 10, zIndex: 900, display: 'flex', gap: 8 }}>
             <button onClick={() => setShowHistory(true)} title="Histórico de alterações" style={fabStyle}>🕘</button>
             <button onClick={() => void logout()} title="Sair" style={fabStyle}>⏻</button>
         </div>
